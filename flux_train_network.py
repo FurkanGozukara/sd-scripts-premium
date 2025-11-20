@@ -509,54 +509,45 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
     def prepare_unet_with_accelerator(
         self, args: argparse.Namespace, accelerator: Accelerator, unet: torch.nn.Module
     ) -> torch.nn.Module:
+        # Get blocks_to_swap count
+        blocks_to_swap_count = args.blocks_to_swap if args.blocks_to_swap is not None else 0
+        
         if not self.is_swapping_blocks:
             unet = super().prepare_unet_with_accelerator(args, accelerator, unet)
             
-            # Compile if requested
+            # Compile if requested (no swapping)
             if hasattr(args, 'compile') and args.compile:
-                logger.info("Compiling FLUX blocks with torch.compile")
-                unwrapped_flux = accelerator.unwrap_model(unet)
-                target_blocks = [
-                    unwrapped_flux.double_blocks,
-                    unwrapped_flux.single_blocks
-                ]
-                unet = compile_utils.compile_model(
+                unet = compile_utils.compile_flux_with_block_swap(
                     args,
                     unet,
-                    target_blocks,
-                    disable_linear=False,
-                    log_prefix="FLUX (LoRA)"
+                    blocks_to_swap_count,  # Will be 0
+                    log_prefix="FLUX LoRA"
                 )
                 # Add _orig_mod reference for accelerator compatibility
                 unet.__dict__["_orig_mod"] = unet
                 
             return unet
 
-        # if we doesn't swap blocks, we can move the model to device
+        # Block swapping is enabled
         flux: flux_models.Flux = unet
         flux = accelerator.prepare(flux, device_placement=[not self.is_swapping_blocks])
         accelerator.unwrap_model(flux).move_to_device_except_swap_blocks(accelerator.device)  # reduce peak memory usage
         accelerator.unwrap_model(flux).prepare_block_swap_before_forward()
         
-        # Compile if requested (with block swapping)
+        # Compile if requested (with smart selective compilation for swapped blocks)
         if hasattr(args, 'compile') and args.compile:
             if args.cpu_offload_checkpointing:
                 logger.warning(
                     "torch.compile with cpu_offload_checkpointing may have compatibility issues. "
                     "If you encounter errors, try disabling one of these options."
                 )
-            logger.info("Compiling FLUX blocks with torch.compile (block swapping enabled)")
-            unwrapped_flux = accelerator.unwrap_model(flux)
-            target_blocks = [
-                unwrapped_flux.double_blocks,
-                unwrapped_flux.single_blocks
-            ]
-            flux = compile_utils.compile_model(
+            
+            # Use smart compilation: only compiles non-swapped blocks
+            flux = compile_utils.compile_flux_with_block_swap(
                 args,
                 flux,
-                target_blocks,
-                disable_linear=True,  # Must disable linear layers when swapping
-                log_prefix="FLUX (LoRA + swap)"
+                blocks_to_swap_count,
+                log_prefix="FLUX LoRA (swap)"
             )
             # Add _orig_mod reference for accelerator compatibility
             flux.__dict__["_orig_mod"] = flux

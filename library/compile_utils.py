@@ -91,6 +91,7 @@ def compile_model(
     target_blocks: List[Union[nn.ModuleList, List[nn.Module]]],
     disable_linear: bool = False,
     log_prefix: str = "Model",
+    skip_blocks: Optional[int] = None,
 ) -> nn.Module:
     """
     Compile model blocks using torch.compile.
@@ -101,6 +102,7 @@ def compile_model(
         target_blocks: List of block lists to compile (e.g., [unet.down_blocks, unet.up_blocks])
         disable_linear: If True, disable compile for Linear layers (useful with block swapping)
         log_prefix: Prefix for log messages
+        skip_blocks: If specified, skip compiling the first N blocks (useful with block swapping)
         
     Returns:
         The model with compiled blocks
@@ -141,12 +143,24 @@ def compile_model(
         logger.info(f"Set torch._dynamo.config.cache_size_limit to {args.compile_cache_size_limit}")
     
     # Compile each block in target_blocks
-    for blocks in target_blocks:
-        if blocks is None:
+    blocks_compiled = 0
+    blocks_skipped = 0
+    
+    logger.info(f"{log_prefix}: Starting compilation of {sum(len(b) for b in target_blocks if b is not None)} blocks...")
+    
+    for block_list_idx, blocks in enumerate(target_blocks):
+        if blocks is None or len(blocks) == 0:
             continue
             
         # Handle both ModuleList and regular lists
         for i, block in enumerate(blocks):
+            # Skip first N blocks if skip_blocks specified (these are swapped to CPU)
+            if skip_blocks is not None and i < skip_blocks:
+                blocks_skipped += 1
+                continue
+            
+            logger.debug(f"{log_prefix}: Compiling block_list[{block_list_idx}][{i}] - {block.__class__.__name__}")
+            
             compiled_block = torch.compile(
                 block,
                 backend=args.compile_backend,
@@ -155,8 +169,125 @@ def compile_model(
                 fullgraph=args.compile_fullgraph,
             )
             blocks[i] = compiled_block
+            blocks_compiled += 1
+    
+    if skip_blocks is not None and blocks_skipped > 0:
+        logger.info(f"Compiled {blocks_compiled} blocks, skipped {blocks_skipped} swapped blocks")
+    else:
+        logger.info(f"Compiled {blocks_compiled} blocks")
+    
+    logger.info(
+        f"{log_prefix}: ⚡ Compilation setup complete. "
+        f"IMPORTANT: Speedup will appear after 10-20 steps (during first forward passes, graphs are captured and compiled). "
+        f"First epoch will be SLOWER. Compare epoch 2+ for speedup measurement."
+    )
     
     return model
+
+
+def compile_flux_with_block_swap(
+    args: argparse.Namespace,
+    flux_model: nn.Module,
+    blocks_to_swap: int,
+    log_prefix: str = "FLUX",
+) -> nn.Module:
+    """
+    Intelligently compile FLUX model considering block swapping.
+    Only compiles blocks that remain on GPU (non-swapped blocks).
+    
+    For FLUX:
+    - blocks_to_swap value translates to:
+      - double_blocks_to_swap = blocks_to_swap // 2
+      - single_blocks_to_swap = (blocks_to_swap - double_blocks_to_swap) * 2
+    - First N blocks are swapped (CPU), rest stay on GPU
+    - We only compile GPU-resident blocks for maximum benefit
+    
+    Args:
+        args: Namespace containing compile arguments
+        flux_model: The FLUX model to compile
+        blocks_to_swap: Number of blocks being swapped (from args.blocks_to_swap)
+        log_prefix: Prefix for log messages
+        
+    Returns:
+        The model with selectively compiled blocks
+    """
+    if not hasattr(args, 'compile') or not args.compile:
+        return flux_model
+        
+    if blocks_to_swap == 0:
+        # No swapping: compile all blocks normally
+        unwrapped = flux_model
+        if hasattr(flux_model, 'module'):  # If wrapped by accelerator
+            unwrapped = flux_model.module
+            
+        target_blocks = [unwrapped.double_blocks, unwrapped.single_blocks]
+        return compile_model(args, flux_model, target_blocks, disable_linear=False, log_prefix=log_prefix)
+    
+    # Block swapping is enabled: selective compilation
+    unwrapped = flux_model
+    if hasattr(flux_model, 'module'):
+        unwrapped = flux_model.module
+        
+    # Calculate which blocks are swapped vs GPU-resident
+    double_blocks_to_swap = blocks_to_swap // 2
+    single_blocks_to_swap = (blocks_to_swap - double_blocks_to_swap) * 2
+    
+    # Get non-swapped blocks (these stay on GPU)
+    total_double = len(unwrapped.double_blocks)
+    total_single = len(unwrapped.single_blocks)
+    
+    non_swapped_double_count = total_double - double_blocks_to_swap
+    non_swapped_single_count = total_single - single_blocks_to_swap
+    
+    logger.info(
+        f"{log_prefix}: Block swap enabled with {blocks_to_swap} blocks "
+        f"(double: {double_blocks_to_swap}/{total_double}, single: {single_blocks_to_swap}/{total_single})"
+    )
+    logger.info(
+        f"{log_prefix}: Will compile non-swapped blocks "
+        f"(double: {non_swapped_double_count}, single: {non_swapped_single_count})"
+    )
+    
+    if non_swapped_double_count <= 0 and non_swapped_single_count <= 0:
+        logger.warning(
+            f"{log_prefix}: All blocks are swapped! No blocks to compile. "
+            "Consider reducing blocks_to_swap or disabling compile."
+        )
+        return flux_model
+    
+    # Create target lists with only non-swapped blocks
+    # We'll compile from index [swapped_count:] onwards
+    target_blocks_to_compile = []
+    
+    if non_swapped_double_count > 0:
+        # Compile double blocks starting from index double_blocks_to_swap
+        target_blocks_to_compile.append(unwrapped.double_blocks[double_blocks_to_swap:])
+    
+    if non_swapped_single_count > 0:
+        # Compile single blocks starting from index single_blocks_to_swap
+        target_blocks_to_compile.append(unwrapped.single_blocks[single_blocks_to_swap:])
+    
+    # Compile only the non-swapped blocks (these can use full compile, no linear disabling needed!)
+    logger.info(
+        f"{log_prefix}: Compiling {non_swapped_double_count} double blocks "
+        f"+ {non_swapped_single_count} single blocks "
+        f"= {non_swapped_double_count + non_swapped_single_count} total blocks with FULL optimization (no linear disabling)"
+    )
+    
+    result = compile_model(
+        args,
+        flux_model,
+        target_blocks_to_compile,
+        disable_linear=False,  # Non-swapped blocks stay on GPU, safe to compile everything!
+        log_prefix=f"{log_prefix} (selective)"
+    )
+    
+    logger.info(
+        f"{log_prefix}: Selective compilation complete. "
+        f"First epoch will be slower (graph capture), subsequent epochs should be ~{int((non_swapped_double_count + non_swapped_single_count) / 57 * 30)}% faster."
+    )
+    
+    return result
 
 
 def maybe_uncompile_state_dict(state_dict: dict) -> dict:

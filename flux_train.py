@@ -471,18 +471,14 @@ def train(args):
                     "torch.compile with cpu_offload_checkpointing may have compatibility issues. "
                     "If you encounter errors, try disabling one of these options."
                 )
-            logger.info("Compiling FLUX blocks with torch.compile")
-            unwrapped_flux = accelerator.unwrap_model(flux)
-            target_blocks = [
-                unwrapped_flux.double_blocks,
-                unwrapped_flux.single_blocks
-            ]
-            flux = compile_utils.compile_model(
+            
+            # Use smart compilation that only compiles non-swapped blocks
+            blocks_to_swap_count = args.blocks_to_swap if args.blocks_to_swap is not None else 0
+            flux = compile_utils.compile_flux_with_block_swap(
                 args,
                 flux,
-                target_blocks,
-                disable_linear=is_swapping_blocks,  # Disable linear layers if swapping blocks
-                log_prefix="FLUX"
+                blocks_to_swap_count,
+                log_prefix="FLUX DreamBooth"
             )
             # Add _orig_mod reference for accelerator compatibility
             flux.__dict__["_orig_mod"] = flux
