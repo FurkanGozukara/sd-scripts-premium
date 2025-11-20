@@ -1357,6 +1357,9 @@ class NetworkTrainer:
         progress_bar = tqdm(
             range(args.max_train_steps - initial_step), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps"
         )
+        
+        # Flag to track if timing has been reset after step 1
+        timing_reset_done = False
 
         validation_steps = (
             min(args.max_validation_steps, len(val_dataloader)) if args.max_validation_steps is not None else len(val_dataloader)
@@ -1486,6 +1489,25 @@ class NetworkTrainer:
                 if accelerator.sync_gradients:
                     progress_bar.update(1)
                     global_step += 1
+
+                    if global_step == 1 and not timing_reset_done:
+                        # Reset timing statistics after the first step to ignore its duration in ETA calculation
+                        progress_bar.unpause()
+                        current_time = progress_bar._time() if hasattr(progress_bar, "_time") else time.time()
+                        progress_bar.start_t = current_time
+                        progress_bar.last_print_t = current_time
+                        progress_bar.last_print_n = 0
+                        progress_bar.n = 0
+                        progress_bar.initial = 0
+                        progress_bar.avg_time = None
+                        
+                        # Reset timing caches
+                        if hasattr(progress_bar, "_time_last"):
+                            progress_bar._time_last = current_time
+                        if hasattr(progress_bar, "_time_last_refresh"):
+                            progress_bar._time_last_refresh = current_time
+                        
+                        timing_reset_done = True
 
                     optimizer_eval_fn()
                     self.sample_images(

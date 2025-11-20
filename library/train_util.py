@@ -1286,6 +1286,8 @@ class BaseDataset(torch.utils.data.Dataset):
         # iterate batches: batch doesn't have image, image will be loaded in cache_batch_latents and discarded
         logger.info("caching latents...")
         for condition, batch in tqdm(batches, smoothing=1, total=len(batches)):
+            for info in batch:
+                tqdm.write(f"{os.path.basename(info.absolute_path)} > {info.caption}")
             cache_batch_latents(vae, cache_to_disk, batch, condition.flip_aug, condition.alpha_mask, condition.random_crop)
 
     def new_cache_text_encoder_outputs(self, models: List[Any], accelerator: Accelerator):
@@ -1341,6 +1343,8 @@ class BaseDataset(torch.utils.data.Dataset):
         # iterate batches
         logger.info("caching Text Encoder outputs...")
         for batch in tqdm(batches, smoothing=1, total=len(batches)):
+            for info in batch:
+                tqdm.write(f"{os.path.basename(info.absolute_path)} > {info.caption}")
             # cache_batch_latents(vae, cache_to_disk, batch, subset.flip_aug, subset.alpha_mask, subset.random_crop)
             caching_strategy.cache_batch_outputs(tokenize_strategy, models, text_encoding_strategy, batch)
 
@@ -1445,6 +1449,8 @@ class BaseDataset(torch.utils.data.Dataset):
         if not is_sd3:
             for batch in tqdm(batches):
                 infos, input_ids1, input_ids2 = zip(*batch)
+                for info in infos:
+                    tqdm.write(f"{os.path.basename(info.absolute_path)} > {info.caption}")
                 input_ids1 = torch.stack(input_ids1, dim=0)
                 input_ids2 = torch.stack(input_ids2, dim=0)
                 cache_batch_text_encoder_outputs(
@@ -1453,6 +1459,8 @@ class BaseDataset(torch.utils.data.Dataset):
         else:
             for batch in tqdm(batches):
                 infos, l_tokens, g_tokens, t5_tokens = zip(*batch)
+                for info in infos:
+                    tqdm.write(f"{os.path.basename(info.absolute_path)} > {info.caption}")
 
                 # stack tokens
                 # l_tokens = [tokens[0] for tokens in l_tokens]
