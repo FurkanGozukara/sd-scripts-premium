@@ -17,7 +17,7 @@ init_ipex()
 
 from accelerate.utils import set_seed
 from diffusers import DDPMScheduler
-from library import deepspeed_utils, sdxl_model_util, strategy_base, strategy_sd, strategy_sdxl, sai_model_spec
+from library import deepspeed_utils, sdxl_model_util, strategy_base, strategy_sd, strategy_sdxl, sai_model_spec, compile_utils
 
 import library.train_util as train_util
 
@@ -494,6 +494,27 @@ def train(args):
         # acceleratorがなんかよろしくやってくれるらしい
         if train_unet:
             unet = accelerator.prepare(unet)
+            
+            # Compile UNet blocks if requested
+            if args.compile and train_unet:
+                logger.info("Compiling UNet blocks with torch.compile")
+                unwrapped_unet = accelerator.unwrap_model(unet)
+                # Get all block lists for SDXL UNet
+                target_blocks = [
+                    unwrapped_unet.down_blocks,
+                    unwrapped_unet.up_blocks,
+                    [unwrapped_unet.mid_block]  # mid_block is a single module, wrap in list
+                ]
+                unet = compile_utils.compile_model(
+                    args, 
+                    unet, 
+                    target_blocks, 
+                    disable_linear=False,
+                    log_prefix="SDXL UNet"
+                )
+                # Add _orig_mod reference for accelerator compatibility
+                unet.__dict__["_orig_mod"] = unet
+                
         if train_text_encoder1:
             text_encoder1 = accelerator.prepare(text_encoder1)
         if train_text_encoder2:
@@ -903,6 +924,7 @@ def setup_parser() -> argparse.ArgumentParser:
     config_util.add_config_arguments(parser)
     custom_train_functions.add_custom_train_arguments(parser)
     sdxl_train_util.add_sdxl_training_arguments(parser)
+    compile_utils.add_compile_arguments(parser)
 
     parser.add_argument(
         "--learning_rate_te1",

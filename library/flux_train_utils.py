@@ -554,6 +554,8 @@ def save_models(
     save_dtype: Optional[torch.dtype] = None,
     use_mem_eff_save: bool = False,
 ):
+    from . import compile_utils
+    
     state_dict = {}
 
     def update_sd(prefix, sd):
@@ -563,7 +565,9 @@ def save_models(
                 v = v.detach().clone().to("cpu").to(save_dtype)
             state_dict[key] = v
 
-    update_sd("", flux.state_dict())
+    # Handle compiled models by stripping _orig_mod prefixes
+    flux_state_dict = compile_utils.maybe_uncompile_state_dict(flux.state_dict())
+    update_sd("", flux_state_dict)
 
     if not use_mem_eff_save:
         save_file(state_dict, ckpt_path, metadata=sai_metadata)

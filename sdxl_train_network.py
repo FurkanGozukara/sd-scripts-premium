@@ -7,7 +7,7 @@ from library.device_utils import init_ipex, clean_memory_on_device
 
 init_ipex()
 
-from library import sdxl_model_util, sdxl_train_util, strategy_base, strategy_sd, strategy_sdxl, train_util
+from library import sdxl_model_util, sdxl_train_util, strategy_base, strategy_sd, strategy_sdxl, train_util, compile_utils
 import train_network
 from library.utils import setup_logging
 
@@ -216,10 +216,42 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
     def sample_images(self, accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet):
         sdxl_train_util.sample_images(accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet)
 
+    def prepare_unet_with_accelerator(
+        self, args: argparse.Namespace, accelerator: Accelerator, unet: torch.nn.Module
+    ) -> torch.nn.Module:
+        """
+        Prepare UNet with accelerator and optionally compile it.
+        """
+        # First prepare with accelerator
+        unet = super().prepare_unet_with_accelerator(args, accelerator, unet)
+        
+        # Then compile if requested
+        if hasattr(args, 'compile') and args.compile:
+            logger.info("Compiling SDXL UNet blocks with torch.compile")
+            unwrapped_unet = accelerator.unwrap_model(unet)
+            # Get all block lists for SDXL UNet
+            target_blocks = [
+                unwrapped_unet.down_blocks,
+                unwrapped_unet.up_blocks,
+                [unwrapped_unet.mid_block]  # mid_block is a single module, wrap in list
+            ]
+            unet = compile_utils.compile_model(
+                args,
+                unet,
+                target_blocks,
+                disable_linear=False,
+                log_prefix="SDXL UNet (LoRA)"
+            )
+            # Add _orig_mod reference for accelerator compatibility
+            unet.__dict__["_orig_mod"] = unet
+            
+        return unet
+
 
 def setup_parser() -> argparse.ArgumentParser:
     parser = train_network.setup_parser()
     sdxl_train_util.add_sdxl_training_arguments(parser)
+    compile_utils.add_compile_arguments(parser)
     return parser
 
 

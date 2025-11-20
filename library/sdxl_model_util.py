@@ -489,6 +489,8 @@ def save_stable_diffusion_checkpoint(
     metadata,
     save_dtype=None,
 ):
+    from . import compile_utils
+    
     state_dict = {}
 
     def update_sd(prefix, sd):
@@ -498,8 +500,9 @@ def save_stable_diffusion_checkpoint(
                 v = v.detach().clone().to("cpu").to(save_dtype)
             state_dict[key] = v
 
-    # Convert the UNet model
-    update_sd("model.diffusion_model.", unet.state_dict())
+    # Convert the UNet model - handle compiled models
+    unet_state_dict = compile_utils.maybe_uncompile_state_dict(unet.state_dict())
+    update_sd("model.diffusion_model.", unet_state_dict)
 
     # Convert the text encoders
     update_sd("conditioner.embedders.0.transformer.", text_encoder1.state_dict())

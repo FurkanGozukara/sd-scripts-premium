@@ -30,7 +30,7 @@ from library.device_utils import init_ipex, clean_memory_on_device
 init_ipex()
 
 from accelerate.utils import set_seed
-from library import deepspeed_utils, flux_train_utils, flux_utils, strategy_base, strategy_flux, sai_model_spec
+from library import deepspeed_utils, flux_train_utils, flux_utils, strategy_base, strategy_flux, sai_model_spec, compile_utils
 from library.sd3_train_utils import FlowMatchEulerDiscreteScheduler
 
 import library.train_util as train_util
@@ -462,6 +462,31 @@ def train(args):
         flux = accelerator.prepare(flux, device_placement=[not is_swapping_blocks])
         if is_swapping_blocks:
             accelerator.unwrap_model(flux).move_to_device_except_swap_blocks(accelerator.device)  # reduce peak memory usage
+            accelerator.unwrap_model(flux).prepare_block_swap_before_forward()
+            
+        # Compile FLUX blocks if requested
+        if args.compile:
+            if args.cpu_offload_checkpointing:
+                logger.warning(
+                    "torch.compile with cpu_offload_checkpointing may have compatibility issues. "
+                    "If you encounter errors, try disabling one of these options."
+                )
+            logger.info("Compiling FLUX blocks with torch.compile")
+            unwrapped_flux = accelerator.unwrap_model(flux)
+            target_blocks = [
+                unwrapped_flux.double_blocks,
+                unwrapped_flux.single_blocks
+            ]
+            flux = compile_utils.compile_model(
+                args,
+                flux,
+                target_blocks,
+                disable_linear=is_swapping_blocks,  # Disable linear layers if swapping blocks
+                log_prefix="FLUX"
+            )
+            # Add _orig_mod reference for accelerator compatibility
+            flux.__dict__["_orig_mod"] = flux
+            
         optimizer, train_dataloader, lr_scheduler = accelerator.prepare(optimizer, train_dataloader, lr_scheduler)
 
     # 実験的機能：勾配も含めたfp16学習を行う　PyTorchにパッチを当ててfp16でのgrad scaleを有効にする
@@ -820,6 +845,7 @@ def setup_parser() -> argparse.ArgumentParser:
     add_custom_train_arguments(parser)  # TODO remove this from here
     train_util.add_dit_training_arguments(parser)
     flux_train_utils.add_flux_train_arguments(parser)
+    compile_utils.add_compile_arguments(parser)
 
     parser.add_argument(
         "--mem_eff_save",
