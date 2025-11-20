@@ -203,17 +203,16 @@ def compile_flux_with_block_swap(
 ) -> nn.Module:
     """
     Intelligently compile FLUX model considering block swapping.
-    
-    When block swapping is enabled, ALL blocks eventually rotate between CPU and GPU during the forward pass.
-    Therefore, we must disable compilation for Linear layers in ALL blocks to avoid compatibility issues
-    with moving weights, while still compiling Attention and other operations.
-    
+
+    When block swapping is enabled, we use fullgraph=True for better compatibility
+    with dynamic weight movement between CPU and GPU.
+
     Args:
         args: Namespace containing compile arguments
         flux_model: The FLUX model to compile
         blocks_to_swap: Number of blocks being swapped (from args.blocks_to_swap)
         log_prefix: Prefix for log messages
-        
+
     Returns:
         The model with compiled blocks
     """
@@ -232,28 +231,35 @@ def compile_flux_with_block_swap(
     if hasattr(flux_model, 'module'):
         unwrapped = flux_model.module
 
-    # If block swapping is enabled, we disable linear layer compilation for ALL blocks.
-    # This is because in the ring-buffer/sliding-window swapping scheme, ALL blocks
-    # eventually get swapped to CPU during the forward pass.
-    disable_linear = blocks_to_swap > 0
-
-    if disable_linear:
+    # When block swapping is enabled, use fullgraph=True for better compatibility
+    # with dynamic device movement, and don't disable Linear layer compilation
+    if blocks_to_swap > 0:
         logger.info(
             f"{log_prefix}: Block swap enabled ({blocks_to_swap} blocks). "
-            f"Disabling Linear layer compilation for ALL blocks to ensure compatibility."
+            f"Enabling fullgraph mode for better compatibility with block swapping."
         )
+        # Temporarily override compile_fullgraph
+        original_fullgraph = getattr(args, 'compile_fullgraph', False)
+        args.compile_fullgraph = True
+        disable_linear = False
     else:
-        logger.info(f"{log_prefix}: Block swap disabled. Full compilation enabled.")
+        logger.info(f"{log_prefix}: Block swap disabled. Using standard compilation.")
+        disable_linear = False
 
     target_blocks = [unwrapped.double_blocks, unwrapped.single_blocks]
-    
-    return compile_model(
-        args, 
-        flux_model, 
-        target_blocks, 
-        disable_linear=disable_linear, 
-        log_prefix=log_prefix
-    )
+
+    try:
+        return compile_model(
+            args,
+            flux_model,
+            target_blocks,
+            disable_linear=disable_linear,
+            log_prefix=log_prefix
+        )
+    finally:
+        # Restore original fullgraph setting
+        if blocks_to_swap > 0:
+            args.compile_fullgraph = original_fullgraph
 
 
 def maybe_uncompile_state_dict(state_dict: dict) -> dict:
