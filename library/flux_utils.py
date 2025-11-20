@@ -97,11 +97,12 @@ def load_flow_model(
     ckpt_path: str,
     dtype: Optional[torch.dtype],
     device: Union[str, torch.device],
-    disable_mmap: bool = False,
+    disable_mmap: bool = True,  # Changed default to True for memory-efficient loading
     model_type: str = "flux",
     fp8_scaled: bool = False,
     loading_device: Optional[Union[str, torch.device]] = None,
     use_scaled_mm: bool = False,
+    disable_numpy_memmap: bool = False,
 ) -> Tuple[bool, flux_models.Flux]:
     if model_type == "flux":
         is_diffusers, is_schnell, (num_double_blocks, num_single_blocks), ckpt_paths = analyze_checkpoint_state(ckpt_path)
@@ -138,7 +139,7 @@ def load_flow_model(
         # Don't cast dtype when loading if using fp8_scaled - load as-is
         load_dtype = None if fp8_scaled else dtype
         for ckpt_path in ckpt_paths:
-            sd.update(load_safetensors(ckpt_path, device=str(flux_loading_device), disable_mmap=disable_mmap, dtype=load_dtype))
+            sd.update(load_safetensors(ckpt_path, device=str(flux_loading_device), disable_mmap=disable_mmap, dtype=load_dtype, disable_numpy_memmap=disable_numpy_memmap))
 
         # convert Diffusers to BFL
         if is_diffusers:
@@ -213,7 +214,7 @@ def load_flow_model(
 
         # load_sft doesn't support torch.device
         logger.info(f"Loading state dict from {ckpt_path}")
-        sd = load_safetensors(ckpt_path, device=str(device), disable_mmap=disable_mmap, dtype=dtype)
+        sd = load_safetensors(ckpt_path, device=str(device), disable_mmap=disable_mmap, dtype=dtype, disable_numpy_memmap=disable_numpy_memmap)
 
         # if the key has annoying prefix, remove it
         for key in list(sd.keys()):
@@ -232,7 +233,7 @@ def load_flow_model(
 
 
 def load_ae(
-    ckpt_path: str, dtype: torch.dtype, device: Union[str, torch.device], disable_mmap: bool = False
+    ckpt_path: str, dtype: torch.dtype, device: Union[str, torch.device], disable_mmap: bool = True, disable_numpy_memmap: bool = False
 ) -> flux_models.AutoEncoder:
     logger.info("Building AutoEncoder")
     with torch.device("meta"):
@@ -240,7 +241,7 @@ def load_ae(
         ae = flux_models.AutoEncoder(flux_models.configs[MODEL_NAME_DEV].ae_params).to(dtype)
 
     logger.info(f"Loading state dict from {ckpt_path}")
-    sd = load_safetensors(ckpt_path, device=str(device), disable_mmap=disable_mmap, dtype=dtype)
+    sd = load_safetensors(ckpt_path, device=str(device), disable_mmap=disable_mmap, dtype=dtype, disable_numpy_memmap=disable_numpy_memmap)
     info = ae.load_state_dict(sd, strict=False, assign=True)
     logger.info(f"Loaded AE: {info}")
     return ae
@@ -306,8 +307,9 @@ def load_clip_l(
     ckpt_path: Optional[str],
     dtype: torch.dtype,
     device: Union[str, torch.device],
-    disable_mmap: bool = False,
+    disable_mmap: bool = True,
     state_dict: Optional[dict] = None,
+    disable_numpy_memmap: bool = False,
 ) -> CLIPTextModel:
     logger.info("Building CLIP-L")
     CLIPL_CONFIG = {
@@ -406,7 +408,7 @@ def load_clip_l(
         sd = state_dict
     else:
         logger.info(f"Loading state dict from {ckpt_path}")
-        sd = load_safetensors(ckpt_path, device=str(device), disable_mmap=disable_mmap, dtype=dtype)
+        sd = load_safetensors(ckpt_path, device=str(device), disable_mmap=disable_mmap, dtype=dtype, disable_numpy_memmap=disable_numpy_memmap)
     info = clip.load_state_dict(sd, strict=False, assign=True)
     logger.info(f"Loaded CLIP-L: {info}")
     return clip
@@ -416,8 +418,9 @@ def load_t5xxl(
     ckpt_path: str,
     dtype: Optional[torch.dtype],
     device: Union[str, torch.device],
-    disable_mmap: bool = False,
+    disable_mmap: bool = True,
     state_dict: Optional[dict] = None,
+    disable_numpy_memmap: bool = False,
 ) -> T5EncoderModel:
     T5_CONFIG_JSON = """
 {
@@ -461,7 +464,7 @@ def load_t5xxl(
         sd = state_dict
     else:
         logger.info(f"Loading state dict from {ckpt_path}")
-        sd = load_safetensors(ckpt_path, device=str(device), disable_mmap=disable_mmap, dtype=dtype)
+        sd = load_safetensors(ckpt_path, device=str(device), disable_mmap=disable_mmap, dtype=dtype, disable_numpy_memmap=disable_numpy_memmap)
     info = t5xxl.load_state_dict(sd, strict=False, assign=True)
     logger.info(f"Loaded T5xxl: {info}")
     return t5xxl

@@ -194,7 +194,7 @@ def train(args):
     # load VAE for caching latents
     ae = None
     if cache_latents:
-        ae = flux_utils.load_ae(args.ae, weight_dtype, "cpu", args.disable_mmap_load_safetensors)
+        ae = flux_utils.load_ae(args.ae, weight_dtype, "cpu", not args.disable_mmap_load_safetensors, disable_numpy_memmap=getattr(args, "disable_numpy_memmap", False))
         ae.to(accelerator.device, dtype=weight_dtype)
         ae.requires_grad_(False)
         ae.eval()
@@ -219,8 +219,8 @@ def train(args):
     strategy_base.TokenizeStrategy.set_strategy(flux_tokenize_strategy)
 
     # load clip_l, t5xxl for caching text encoder outputs
-    clip_l = flux_utils.load_clip_l(args.clip_l, weight_dtype, "cpu", args.disable_mmap_load_safetensors)
-    t5xxl = flux_utils.load_t5xxl(args.t5xxl, weight_dtype, "cpu", args.disable_mmap_load_safetensors)
+    clip_l = flux_utils.load_clip_l(args.clip_l, weight_dtype, "cpu", not args.disable_mmap_load_safetensors, disable_numpy_memmap=getattr(args, "disable_numpy_memmap", False))
+    t5xxl = flux_utils.load_t5xxl(args.t5xxl, weight_dtype, "cpu", not args.disable_mmap_load_safetensors, disable_numpy_memmap=getattr(args, "disable_numpy_memmap", False))
     clip_l.eval()
     t5xxl.eval()
     clip_l.requires_grad_(False)
@@ -271,7 +271,7 @@ def train(args):
 
     # load FLUX
     _, flux = flux_utils.load_flow_model(
-        args.pretrained_model_name_or_path, weight_dtype, "cpu", args.disable_mmap_load_safetensors, model_type="flux"
+        args.pretrained_model_name_or_path, weight_dtype, "cpu", not args.disable_mmap_load_safetensors, model_type="flux", disable_numpy_memmap=getattr(args, "disable_numpy_memmap", False)
     )
 
     if args.gradient_checkpointing:
@@ -306,7 +306,7 @@ def train(args):
 
     if not cache_latents:
         # load VAE here if not cached
-        ae = flux_utils.load_ae(args.ae, weight_dtype, "cpu")
+        ae = flux_utils.load_ae(args.ae, weight_dtype, "cpu", not args.disable_mmap_load_safetensors, disable_numpy_memmap=getattr(args, "disable_numpy_memmap", False))
         ae.requires_grad_(False)
         ae.eval()
         ae.to(accelerator.device, dtype=weight_dtype)

@@ -128,11 +128,12 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
             args.pretrained_model_name_or_path,
             loading_dtype,
             fp8_calc_device,  # Use GPU for fp8_scaled quantization, CPU otherwise
-            disable_mmap=args.disable_mmap_load_safetensors,
+            disable_mmap=not args.disable_mmap_load_safetensors,  # Inverted: memory-efficient loading is now default
             model_type=self.model_type,
             fp8_scaled=args.fp8_scaled,
             loading_device="cpu",
             use_scaled_mm=getattr(args, "fp8_fast", False),
+            disable_numpy_memmap=getattr(args, "disable_numpy_memmap", False),
         )
         if args.fp8_base and not args.fp8_scaled:
             # check dtype of model
@@ -157,7 +158,7 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
             model.enable_block_swap(args.blocks_to_swap, accelerator.device)
 
         if self.use_clip_l:
-            clip_l = flux_utils.load_clip_l(args.clip_l, weight_dtype, "cpu", disable_mmap=args.disable_mmap_load_safetensors)
+            clip_l = flux_utils.load_clip_l(args.clip_l, weight_dtype, "cpu", disable_mmap=not args.disable_mmap_load_safetensors, disable_numpy_memmap=getattr(args, "disable_numpy_memmap", False))
         else:
             clip_l = flux_utils.dummy_clip_l()  # dummy CLIP-L for Chroma, which does not use CLIP-L
         clip_l.eval()
@@ -169,7 +170,7 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
             loading_dtype = weight_dtype
 
         # loading t5xxl to cpu takes a long time, so we should load to gpu in future
-        t5xxl = flux_utils.load_t5xxl(args.t5xxl, loading_dtype, "cpu", disable_mmap=args.disable_mmap_load_safetensors)
+        t5xxl = flux_utils.load_t5xxl(args.t5xxl, loading_dtype, "cpu", disable_mmap=not args.disable_mmap_load_safetensors, disable_numpy_memmap=getattr(args, "disable_numpy_memmap", False))
         t5xxl.eval()
         if args.fp8_base and not args.fp8_base_unet:
             # check dtype of model
@@ -178,7 +179,7 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
             elif t5xxl.dtype == torch.float8_e4m3fn:
                 logger.info("Loaded fp8 T5XXL model")
 
-        ae = flux_utils.load_ae(args.ae, weight_dtype, "cpu", disable_mmap=args.disable_mmap_load_safetensors)
+        ae = flux_utils.load_ae(args.ae, weight_dtype, "cpu", disable_mmap=not args.disable_mmap_load_safetensors, disable_numpy_memmap=getattr(args, "disable_numpy_memmap", False))
 
         model_version = flux_utils.MODEL_VERSION_FLUX_V1 if self.model_type != "chroma" else flux_utils.MODEL_VERSION_CHROMA
         return model_version, [clip_l, t5xxl], ae, model

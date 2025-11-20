@@ -88,15 +88,17 @@ class MemoryEfficientSafeOpen:
     by using memory mapping for large tensors and avoiding unnecessary copies.
     """
 
-    def __init__(self, filename):
+    def __init__(self, filename, disable_numpy_memmap=False):
         """Initialize the SafeTensor reader.
 
         Args:
             filename (str): Path to the safetensors file to read.
+            disable_numpy_memmap (bool): If True, disable numpy memory mapping for large tensors, using standard file read instead.
         """
         self.filename = filename
         self.file = open(filename, "rb")
         self.header, self.header_size = self._read_header()
+        self.disable_numpy_memmap = disable_numpy_memmap
 
     def __enter__(self):
         """Enter context manager."""
@@ -178,7 +180,8 @@ class MemoryEfficientSafeOpen:
         # Use memmap for large tensors to avoid intermediate copies.
         # If device is cpu, tensor is not copied to gpu, so using memmap locks the file, which is not desired.
         # So we only use memmap if device is not cpu.
-        if num_bytes > 10 * 1024 * 1024 and device is not None and device.type != "cpu":
+        # If disable_numpy_memmap is True, skip numpy memory mapping to load with standard file read.
+        if not self.disable_numpy_memmap and num_bytes > 10 * 1024 * 1024 and device is not None and device.type != "cpu":
             # Create memory map for zero-copy reading
             mm = np.memmap(self.filename, mode="c", dtype=np.uint8, offset=tensor_offset, shape=(num_bytes,))
             byte_tensor = torch.from_numpy(mm)  # zero copy
@@ -285,7 +288,7 @@ class MemoryEfficientSafeOpen:
 
 
 def load_safetensors(
-    path: str, device: Union[str, torch.device], disable_mmap: bool = False, dtype: Optional[torch.dtype] = None
+    path: str, device: Union[str, torch.device], disable_mmap: bool = False, dtype: Optional[torch.dtype] = None, disable_numpy_memmap: bool = False
 ) -> dict[str, torch.Tensor]:
     if disable_mmap:
         # return safetensors.torch.load(open(path, "rb").read())
@@ -293,7 +296,7 @@ def load_safetensors(
         # logger.info(f"Loading without mmap (experimental)")
         state_dict = {}
         device = torch.device(device) if device is not None else None
-        with MemoryEfficientSafeOpen(path) as f:
+        with MemoryEfficientSafeOpen(path, disable_numpy_memmap=disable_numpy_memmap) as f:
             for key in f.keys():
                 state_dict[key] = f.get_tensor(key, device=device, dtype=dtype)
         synchronize_device(device)
@@ -310,7 +313,7 @@ def load_safetensors(
 
 
 def load_split_weights(
-    file_path: str, device: Union[str, torch.device] = "cpu", disable_mmap: bool = False, dtype: Optional[torch.dtype] = None
+    file_path: str, device: Union[str, torch.device] = "cpu", disable_mmap: bool = False, dtype: Optional[torch.dtype] = None, disable_numpy_memmap: bool = False
 ) -> Dict[str, torch.Tensor]:
     """
     Load split weights from a file. If the file name ends with 00001-of-00004 etc, it will load all files with the same prefix.
@@ -329,11 +332,11 @@ def load_split_weights(
             filename = f"{prefix}{i + 1:05d}-of-{count:05d}.safetensors"
             filepath = os.path.join(os.path.dirname(file_path), filename)
             if os.path.exists(filepath):
-                state_dict.update(load_safetensors(filepath, device=device, disable_mmap=disable_mmap, dtype=dtype))
+                state_dict.update(load_safetensors(filepath, device=device, disable_mmap=disable_mmap, dtype=dtype, disable_numpy_memmap=disable_numpy_memmap))
             else:
                 raise FileNotFoundError(f"File {filepath} not found")
     else:
-        state_dict = load_safetensors(file_path, device=device, disable_mmap=disable_mmap, dtype=dtype)
+        state_dict = load_safetensors(file_path, device=device, disable_mmap=disable_mmap, dtype=dtype, disable_numpy_memmap=disable_numpy_memmap)
     return state_dict
 
 

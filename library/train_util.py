@@ -4316,7 +4316,14 @@ def add_dit_training_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--disable_mmap_load_safetensors",
         action="store_true",
-        help="disable mmap load for safetensors. Speed up model loading in WSL environment / safetensorsのmmapロードを無効にする。WSL環境等でモデル読み込みを高速化できる",
+        help="disable memory-efficient loading for safetensors (NOT RECOMMENDED: uses more RAM). Use this to revert to old behavior."
+        " / safetensorsのメモリ効率的なロードを無効にする（非推奨：RAMを多く使用）。古い動作に戻す場合に使用。",
+    )
+    parser.add_argument(
+        "--disable_numpy_memmap",
+        action="store_true",
+        help="disable numpy memory mapping optimization (use if memmap causes issues on your system)"
+        " / numpy メモリマップ最適化を無効にする（メモリマップで問題が発生する場合に使用）",
     )
 
     # Training arguments. partial copy from Diffusers
