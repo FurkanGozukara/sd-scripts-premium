@@ -27,6 +27,12 @@ TOKENIZER2_PATH = "laion/CLIP-ViT-bigG-14-laion2B-39B-b160k"
 
 def load_target_model(args, accelerator, model_version: str, weight_dtype):
     model_dtype = match_mixed_precision(args, weight_dtype)  # prepare fp16/bf16
+    
+    # Handle fp8_scaled option
+    fp8_scaled = getattr(args, "fp8_scaled", False)
+    if fp8_scaled:
+        model_dtype = None  # Load as-is for fp8_scaled
+    
     for pi in range(accelerator.state.num_processes):
         if pi == accelerator.state.local_process_index:
             logger.info(f"loading model for process {accelerator.state.local_process_index}/{accelerator.state.num_processes}")
@@ -47,6 +53,9 @@ def load_target_model(args, accelerator, model_version: str, weight_dtype):
                 accelerator.device if args.lowram else "cpu",
                 model_dtype,
                 args.disable_mmap_load_safetensors,
+                fp8_scaled=fp8_scaled,
+                calc_device=accelerator.device,
+                use_scaled_mm=getattr(args, "fp8_fast", False),
             )
 
             # work on low-ram device
@@ -63,7 +72,16 @@ def load_target_model(args, accelerator, model_version: str, weight_dtype):
 
 
 def _load_target_model(
-    name_or_path: str, vae_path: Optional[str], model_version: str, weight_dtype, device="cpu", model_dtype=None, disable_mmap=False
+    name_or_path: str,
+    vae_path: Optional[str],
+    model_version: str,
+    weight_dtype,
+    device="cpu",
+    model_dtype=None,
+    disable_mmap=False,
+    fp8_scaled: bool = False,
+    calc_device: Optional[torch.device] = None,
+    use_scaled_mm: bool = False,
 ):
     # model_dtype only work with full fp16/bf16
     name_or_path = os.readlink(name_or_path) if os.path.islink(name_or_path) else name_or_path
@@ -124,6 +142,18 @@ def _load_target_model(
 
         logit_scale = None
         ckpt_info = None
+
+    # Apply fp8_scaled optimization if requested
+    if fp8_scaled:
+        logger.info("Applying FP8 scaled optimization to UNet")
+        if calc_device is None:
+            calc_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # Get the state dict, optimize it, and reload
+        state_dict = unet.state_dict()
+        state_dict = unet.fp8_optimization(state_dict, calc_device, move_to_device=(device != "cpu"), use_scaled_mm=use_scaled_mm)
+        unet.load_state_dict(state_dict, strict=True, assign=True)
+        logger.info("FP8 scaled optimization applied to UNet")
 
     # VAEを読み込む
     if vae_path is not None:

@@ -5,6 +5,7 @@ from typing import List, Optional, Tuple, Union
 
 import einops
 import torch
+import torch.nn as nn
 from accelerate import init_empty_weights
 from safetensors import safe_open
 from safetensors.torch import load_file
@@ -98,14 +99,24 @@ def load_flow_model(
     device: Union[str, torch.device],
     disable_mmap: bool = False,
     model_type: str = "flux",
+    fp8_scaled: bool = False,
+    loading_device: Optional[Union[str, torch.device]] = None,
+    use_scaled_mm: bool = False,
 ) -> Tuple[bool, flux_models.Flux]:
     if model_type == "flux":
         is_diffusers, is_schnell, (num_double_blocks, num_single_blocks), ckpt_paths = analyze_checkpoint_state(ckpt_path)
         name = MODEL_NAME_DEV if not is_schnell else MODEL_NAME_SCHNELL
 
+        # Determine loading device
+        if loading_device is None:
+            loading_device = device
+        device = torch.device(device)
+        loading_device = torch.device(loading_device) if loading_device is not None else device
+        flux_loading_device = loading_device if not fp8_scaled else torch.device("cpu")
+
         # build model
         logger.info(f"Building Flux model {name} from {'Diffusers' if is_diffusers else 'BFL'} checkpoint")
-        with torch.device("meta"):
+        with init_empty_weights():
             params = flux_models.configs[name].params
 
             # set the number of blocks
@@ -117,14 +128,17 @@ def load_flow_model(
                 params = replace(params, depth_single_blocks=num_single_blocks)
 
             model = flux_models.Flux(params)
+            # Even for fp8_scaled, set dtype on meta device (won't affect actual weights until load_state_dict)
             if dtype is not None:
                 model = model.to(dtype)
 
         # load_sft doesn't support torch.device
-        logger.info(f"Loading state dict from {ckpt_path}")
+        logger.info(f"Loading state dict from {ckpt_path} to {flux_loading_device}")
         sd = {}
+        # Don't cast dtype when loading if using fp8_scaled - load as-is
+        load_dtype = None if fp8_scaled else dtype
         for ckpt_path in ckpt_paths:
-            sd.update(load_safetensors(ckpt_path, device=device, disable_mmap=disable_mmap, dtype=dtype))
+            sd.update(load_safetensors(ckpt_path, device=str(flux_loading_device), disable_mmap=disable_mmap, dtype=load_dtype))
 
         # convert Diffusers to BFL
         if is_diffusers:
@@ -139,7 +153,51 @@ def load_flow_model(
                 break  # the model doesn't have annoying prefix
             sd[new_key] = sd.pop(key)
 
+        # if fp8_scaled is True, convert the model to fp8
+        if fp8_scaled:
+            # fp8 optimization: calculate on device, move to loading_device (CPU for block swap, GPU otherwise)
+            logger.info("Optimizing model weights to fp8. This may take a while.")
+            # Fixed: move_to_device should be True when loading_device is CPU (to move from calc device back to CPU)
+            sd = model.fp8_optimization(sd, device, move_to_device=(loading_device.type == "cpu"), use_scaled_mm=use_scaled_mm)
+
+            if loading_device.type != "cpu":
+                # make sure all the model weights are on the loading_device
+                logger.info(f"Moving weights to {loading_device}")
+                for key in sd.keys():
+                    sd[key] = sd[key].to(loading_device)
+
+        # Load state dict - assign=True should preserve FP8 dtypes
+        if fp8_scaled:
+            # Diagnostic: check a sample weight dtype in state dict before loading
+            for key in sd.keys():
+                if "double_blocks.0.img_attn.qkv.weight" in key:
+                    logger.info(f"Before load_state_dict: {key} dtype in state_dict: {sd[key].dtype}, device: {sd[key].device}")
+                    break
+        
         info = model.load_state_dict(sd, strict=False, assign=True)
+        
+        if fp8_scaled:
+            # Diagnostic: check the weight dtype AFTER loading and calculate actual memory
+            fp8_count = 0
+            non_fp8_count = 0
+            fp8_bytes = 0
+            non_fp8_bytes = 0
+            
+            for name, module in model.named_modules():
+                if isinstance(module, nn.Linear):
+                    weight_bytes = module.weight.nelement() * module.weight.element_size()
+                    if hasattr(module, 'scale_weight'):
+                        fp8_count += 1
+                        fp8_bytes += weight_bytes
+                        if fp8_count == 1:  # Log first example
+                            logger.info(f"FP8 layer example: {name} - weight dtype: {module.weight.dtype}, scale dtype: {module.scale_weight.dtype}, scale shape: {module.scale_weight.shape}")
+                    else:
+                        non_fp8_count += 1
+                        non_fp8_bytes += weight_bytes
+            
+            logger.info(f"FP8 layers: {fp8_count}, Non-FP8 layers: {non_fp8_count}")
+            logger.info(f"FP8 weight memory: {fp8_bytes / 1024**3:.2f} GB, Non-FP8 weight memory: {non_fp8_bytes / 1024**3:.2f} GB")
+            
         logger.info(f"Loaded Flux: {info}")
         return is_schnell, model
 

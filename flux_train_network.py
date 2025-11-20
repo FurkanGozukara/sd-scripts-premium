@@ -57,6 +57,15 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         if args.fp8_base_unet:
             args.fp8_base = True  # if fp8_base_unet is enabled, fp8_base is also enabled for FLUX.1
 
+        # Handle fp8_scaled option
+        if args.fp8_scaled:
+            if args.fp8_base or args.fp8_base_unet:
+                logger.warning(
+                    "fp8_scaled is used, so fp8_base and fp8_base_unet are ignored / fp8_scaledが使われているので、fp8_baseとfp8_base_unetは無視されます"
+                )
+            args.fp8_base = False
+            args.fp8_base_unet = False
+
         if args.cache_text_encoder_outputs_to_disk and not args.cache_text_encoder_outputs:
             logger.warning(
                 "cache_text_encoder_outputs_to_disk is enabled, so cache_text_encoder_outputs is also enabled / cache_text_encoder_outputs_to_diskが有効になっているため、cache_text_encoder_outputsも有効になります"
@@ -101,17 +110,31 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         # currently offload to cpu for some models
 
         # if the file is fp8 and we are using fp8_base, we can load it as is (fp8)
-        loading_dtype = None if args.fp8_base else weight_dtype
+        # if fp8_scaled, we don't set dtype (load as-is)
+        if args.fp8_scaled:
+            loading_dtype = None
+        else:
+            loading_dtype = None if args.fp8_base else weight_dtype
+
+        # For fp8_scaled, use accelerator device for quantization calculation to avoid CPU bottleneck
+        # while keeping the model staged on CPU until after caching
+        if args.fp8_scaled:
+            fp8_calc_device = accelerator.device
+        else:
+            fp8_calc_device = "cpu"
 
         # if we load to cpu, flux.to(fp8) takes a long time, so we should load to gpu in future
         _, model = flux_utils.load_flow_model(
             args.pretrained_model_name_or_path,
             loading_dtype,
-            "cpu",
+            fp8_calc_device,  # Use GPU for fp8_scaled quantization, CPU otherwise
             disable_mmap=args.disable_mmap_load_safetensors,
             model_type=self.model_type,
+            fp8_scaled=args.fp8_scaled,
+            loading_device="cpu",
+            use_scaled_mm=getattr(args, "fp8_fast", False),
         )
-        if args.fp8_base:
+        if args.fp8_base and not args.fp8_scaled:
             # check dtype of model
             if model.dtype == torch.float8_e4m3fnuz or model.dtype == torch.float8_e5m2 or model.dtype == torch.float8_e5m2fnuz:
                 raise ValueError(f"Unsupported fp8 model dtype: {model.dtype}")
@@ -460,6 +483,11 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
     def is_text_encoder_not_needed_for_training(self, args):
         return args.cache_text_encoder_outputs and not self.is_train_text_encoder(args)
 
+    def cast_unet(self, args):
+        # Override to prevent casting FP8-scaled models back to bf16/fp16
+        # FP8-scaled models should keep their optimized FP8 weights
+        return not getattr(args, 'fp8_scaled', False)
+
     def prepare_text_encoder_grad_ckpt_workaround(self, index, text_encoder):
         if index == 0:  # CLIP-L
             return super().prepare_text_encoder_grad_ckpt_workaround(index, text_encoder)
@@ -569,6 +597,18 @@ def setup_parser() -> argparse.ArgumentParser:
         # + "/[実験的] Fluxモデルの分割モードを使用する。ネットワーク引数`train_blocks=single`が必要",
         help="[Deprecated] This option is deprecated. Please use `--blocks_to_swap` instead."
         " / このオプションは非推奨です。代わりに`--blocks_to_swap`を使用してください。",
+    )
+    parser.add_argument(
+        "--fp8_scaled",
+        action="store_true",
+        help="Use scaled fp8 for FLUX model (recommended for VRAM reduction, works with block swap/torch compile)"
+        " / FLUXモデルにスケーリングされたfp8を使う（VRAM削減に推奨、ブロックスワップ/torch compileと併用可能）",
+    )
+    parser.add_argument(
+        "--fp8_fast",
+        action="store_true",
+        help="Enable fast FP8 arithmetic (requires SM 8.9+, RTX 4XXX+), only effective with fp8_scaled"
+        " / 高速FP8演算を有効化（SM 8.9+が必要、RTX 4XXX+）、fp8_scaledと併用時のみ有効",
     )
     return parser
 

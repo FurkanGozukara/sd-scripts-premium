@@ -1071,6 +1071,48 @@ class SdxlUNet2DConditionModel(nn.Module):
 
     # endregion
 
+    def fp8_optimization(
+        self, state_dict: dict, device: torch.device, move_to_device: bool, use_scaled_mm: bool = False
+    ) -> dict:
+        """
+        Optimize the model state_dict with fp8.
+
+        Args:
+            state_dict (dict): The state_dict of the model.
+            device (torch.device): The device to calculate the weight.
+            move_to_device (bool): Whether to move the weight to the device after optimization.
+            use_scaled_mm (bool): Whether to use scaled matrix multiplication for fp8.
+
+        Returns:
+            dict: FP8 optimized state dict
+        """
+        # Target transformer blocks and resnet blocks, exclude norms and embeddings
+        TARGET_KEYS = ["input_blocks", "middle_block", "output_blocks"]
+        EXCLUDE_KEYS = [
+            "time_embed",
+            "label_emb",
+            "conv_in",
+            "conv_out",
+            "norm",
+            "proj_in",
+            "proj_out",
+        ]
+
+        from library.fp8_optimization_utils import apply_fp8_monkey_patch, optimize_state_dict_with_fp8
+        import logging
+        logger = logging.getLogger(__name__)
+
+        if use_scaled_mm:
+            logger.info("fp8_fast is enabled, but block-wise quantization will fall back to standard forward for non-per-tensor scales")
+
+        # inplace optimization
+        state_dict = optimize_state_dict_with_fp8(state_dict, device, TARGET_KEYS, EXCLUDE_KEYS, move_to_device=move_to_device)
+
+        # apply monkey patching
+        apply_fp8_monkey_patch(self, state_dict, use_scaled_mm=use_scaled_mm)
+
+        return state_dict
+
     def forward(self, x, timesteps=None, context=None, y=None, **kwargs):
         # broadcast timesteps to batch dimension
         timesteps = timesteps.expand(x.shape[0])

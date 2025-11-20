@@ -252,6 +252,20 @@ def setup_parser() -> argparse.ArgumentParser:
     parser = train_network.setup_parser()
     sdxl_train_util.add_sdxl_training_arguments(parser)
     compile_utils.add_compile_arguments(parser)
+    
+    parser.add_argument(
+        "--fp8_scaled",
+        action="store_true",
+        help="Use scaled fp8 for SDXL UNet (recommended for VRAM reduction)"
+        " / SDXL UNetにスケーリングされたfp8を使う（VRAM削減に推奨）",
+    )
+    parser.add_argument(
+        "--fp8_fast",
+        action="store_true",
+        help="Enable fast FP8 arithmetic (requires SM 8.9+, RTX 4XXX+), only effective with fp8_scaled"
+        " / 高速FP8演算を有効化（SM 8.9+が必要、RTX 4XXX+）、fp8_scaledと併用時のみ有効",
+    )
+    
     return parser
 
 

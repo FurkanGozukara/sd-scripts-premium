@@ -1056,6 +1056,7 @@ class NetworkTrainer:
             "ss_huber_c": args.huber_c,
             "ss_fp8_base": bool(args.fp8_base),
             "ss_fp8_base_unet": bool(args.fp8_base_unet),
+            "ss_fp8_scaled": bool(getattr(args, "fp8_scaled", False)),
             "ss_validation_seed": args.validation_seed,
             "ss_validation_split": args.validation_split,
             "ss_max_validation_steps": args.max_validation_steps,

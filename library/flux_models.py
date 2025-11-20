@@ -1009,6 +1009,42 @@ class Flux(nn.Module):
         self.offloader_double.prepare_block_devices_before_forward(self.double_blocks)
         self.offloader_single.prepare_block_devices_before_forward(self.single_blocks)
 
+    def fp8_optimization(
+        self, state_dict: dict, device: torch.device, move_to_device: bool, use_scaled_mm: bool = False
+    ) -> dict:
+        """
+        Optimize the model state_dict with fp8.
+
+        Args:
+            state_dict (dict): The state_dict of the model.
+            device (torch.device): The device to calculate the weight.
+            move_to_device (bool): Whether to move the weight to the device after optimization.
+            use_scaled_mm (bool): Whether to use scaled matrix multiplication for fp8.
+
+        Returns:
+            dict: FP8 optimized state dict
+        """
+        TARGET_KEYS = ["single_blocks", "double_blocks"]
+        EXCLUDE_KEYS = [
+            "norm",
+            "mod",
+        ]
+
+        from library.fp8_optimization_utils import apply_fp8_monkey_patch, optimize_state_dict_with_fp8
+        import logging
+        logger = logging.getLogger(__name__)
+
+        if use_scaled_mm:
+            logger.info("fp8_fast is enabled, but block-wise quantization will fall back to standard forward for non-per-tensor scales")
+
+        # inplace optimization
+        state_dict = optimize_state_dict_with_fp8(state_dict, device, TARGET_KEYS, EXCLUDE_KEYS, move_to_device=move_to_device)
+
+        # apply monkey patching
+        apply_fp8_monkey_patch(self, state_dict, use_scaled_mm=use_scaled_mm)
+
+        return state_dict
+
     def get_mod_vectors(self, timesteps: Tensor, guidance: Tensor | None = None, batch_size: int | None = None) -> Tensor:
         return None  # FLUX.1 does not use mod_vectors, but Chroma does.
 
