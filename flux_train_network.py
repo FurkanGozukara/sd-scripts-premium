@@ -530,11 +530,13 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
 
         # Block swapping is enabled
         flux: flux_models.Flux = unet
+        
+        # Setup block swapping and accelerator FIRST (like musubi-tuner)
         flux = accelerator.prepare(flux, device_placement=[not self.is_swapping_blocks])
         accelerator.unwrap_model(flux).move_to_device_except_swap_blocks(accelerator.device)  # reduce peak memory usage
         accelerator.unwrap_model(flux).prepare_block_swap_before_forward()
         
-        # Compile if requested (with smart selective compilation for swapped blocks)
+        # THEN compile AFTER setup (like musubi-tuner does)
         if hasattr(args, 'compile') and args.compile:
             if args.cpu_offload_checkpointing:
                 logger.warning(
@@ -542,7 +544,6 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
                     "If you encounter errors, try disabling one of these options."
                 )
             
-            # Use smart compilation: only compiles non-swapped blocks
             flux = compile_utils.compile_flux_with_block_swap(
                 args,
                 flux,
