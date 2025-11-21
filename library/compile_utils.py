@@ -92,6 +92,8 @@ def compile_model(
     disable_linear: bool = False,
     log_prefix: str = "Model",
     skip_blocks: Optional[int] = None,
+    skip_first_blocks_per_list: Optional[List[Optional[int]]] = None,
+    skip_last_blocks_per_list: Optional[List[Optional[int]]] = None,
 ) -> nn.Module:
     """
     Compile model blocks using torch.compile.
@@ -103,6 +105,10 @@ def compile_model(
         disable_linear: If True, disable compile for Linear layers (useful with block swapping)
         log_prefix: Prefix for log messages
         skip_blocks: If specified, skip compiling the first N blocks (useful with block swapping)
+        skip_first_blocks_per_list: Optional list matching target_blocks specifying how many leading
+            blocks to skip compiling for each block list (useful when those blocks are swapped/offloaded)
+        skip_last_blocks_per_list: Optional list matching target_blocks specifying how many trailing
+            blocks to skip compiling for each block list (useful when those blocks are swapped/offloaded)
         
     Returns:
         The model with compiled blocks
@@ -152,14 +158,31 @@ def compile_model(
     
     logger.info(f"{log_prefix}: Starting compilation of {sum(len(b) for b in target_blocks if b is not None)} blocks...")
     
+    global_skip_first = skip_blocks or 0
+
     for block_list_idx, blocks in enumerate(target_blocks):
         if blocks is None or len(blocks) == 0:
             continue
-            
+        
+        skip_first = global_skip_first
+        if skip_first_blocks_per_list is not None and block_list_idx < len(skip_first_blocks_per_list):
+            per_list_value = skip_first_blocks_per_list[block_list_idx]
+            if per_list_value is not None and per_list_value > 0:
+                skip_first += per_list_value
+        
+        skip_last = 0
+        if skip_last_blocks_per_list is not None and block_list_idx < len(skip_last_blocks_per_list):
+            per_list_last = skip_last_blocks_per_list[block_list_idx]
+            if per_list_last is not None and per_list_last > 0:
+                skip_last = min(len(blocks), max(0, per_list_last))
+        
         # Handle both ModuleList and regular lists
         for i, block in enumerate(blocks):
             # Skip first N blocks if skip_blocks specified (these are swapped to CPU)
-            if skip_blocks is not None and i < skip_blocks:
+            if skip_first is not None and i < skip_first:
+                blocks_skipped += 1
+                continue
+            if skip_last > 0 and (len(blocks) - i) <= skip_last:
                 blocks_skipped += 1
                 continue
             
@@ -181,8 +204,8 @@ def compile_model(
             else:
                 logger.warning(f"  ✗ Block {i} may not be properly compiled!")
     
-    if skip_blocks is not None and blocks_skipped > 0:
-        logger.info(f"Compiled {blocks_compiled} blocks, skipped {blocks_skipped} swapped blocks")
+    if blocks_skipped > 0:
+        logger.info(f"Compiled {blocks_compiled} blocks, skipped {blocks_skipped} blocks (swap/offloaded)")
     else:
         logger.info(f"Compiled {blocks_compiled} blocks")
     
@@ -233,6 +256,9 @@ def compile_flux_with_block_swap(
 
     # When block swapping is enabled, use fullgraph=True for better compatibility
     # with dynamic device movement, and don't disable Linear layer compilation
+    skip_first_config: Optional[List[Optional[int]]] = None
+    skip_last_config: Optional[List[Optional[int]]] = None
+
     if blocks_to_swap > 0:
         logger.info(
             f"{log_prefix}: Block swap enabled ({blocks_to_swap} blocks). "
@@ -242,6 +268,31 @@ def compile_flux_with_block_swap(
         original_fullgraph = getattr(args, 'compile_fullgraph', False)
         args.compile_fullgraph = True
         disable_linear = False
+
+        double_blocks = getattr(unwrapped, "double_blocks", None)
+        single_blocks = getattr(unwrapped, "single_blocks", None)
+
+        total_double = len(double_blocks) if double_blocks is not None else 0
+        total_single = len(single_blocks) if single_blocks is not None else 0
+
+        double_blocks_to_swap = min(blocks_to_swap // 2, total_double)
+        remaining_for_single = blocks_to_swap - double_blocks_to_swap
+        single_blocks_to_swap = min(remaining_for_single * 2, total_single)
+
+        non_swapped_double = total_double - double_blocks_to_swap
+        non_swapped_single = total_single - single_blocks_to_swap
+
+        logger.info(
+            f"{log_prefix}: Selectively compiling non-swapped blocks "
+            f"(double={non_swapped_double}/{total_double}, single={non_swapped_single}/{total_single})."
+        )
+
+        skip_sizes = [
+            double_blocks_to_swap if total_double > 0 else 0,
+            single_blocks_to_swap if total_single > 0 else 0,
+        ]
+        skip_first_config = skip_sizes
+        skip_last_config = skip_sizes
     else:
         logger.info(f"{log_prefix}: Block swap disabled. Using standard compilation.")
         disable_linear = False
@@ -254,7 +305,9 @@ def compile_flux_with_block_swap(
             flux_model,
             target_blocks,
             disable_linear=disable_linear,
-            log_prefix=log_prefix
+            log_prefix=log_prefix,
+            skip_first_blocks_per_list=skip_first_config,
+            skip_last_blocks_per_list=skip_last_config,
         )
     finally:
         # Restore original fullgraph setting
