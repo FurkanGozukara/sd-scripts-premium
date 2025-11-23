@@ -648,6 +648,12 @@ def add_flux_train_arguments(parser: argparse.ArgumentParser):
         action="store_true",
         help="apply attention mask to T5-XXL encode and FLUX double blocks / T5-XXLエンコードとFLUXダブルブロックにアテンションマスクを適用する",
     )
+    parser.add_argument(
+        "--cache_text_encoder_outputs_on_cpu",
+        action="store_true",
+        help="cache text encoder outputs on CPU to reduce VRAM usage during caching (slower but saves VRAM)"
+        " / テキストエンコーダの出力をCPUにキャッシュしてVRAM使用量を削減（遅くなるがVRAMを節約）",
+    )
 
     parser.add_argument(
         "--guidance_scale",

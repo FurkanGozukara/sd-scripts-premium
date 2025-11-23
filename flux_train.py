@@ -233,8 +233,15 @@ def train(args):
     sample_prompts_te_outputs = None
     if args.cache_text_encoder_outputs:
         # Text Encodes are eval and no grad here
-        clip_l.to(accelerator.device)
-        t5xxl.to(accelerator.device)
+        # Determine device for text encoder caching
+        if args.cache_text_encoder_outputs_on_cpu:
+            logger.info("cache text encoder outputs on CPU to reduce VRAM usage")
+            te_device = "cpu"
+        else:
+            te_device = accelerator.device
+        
+        clip_l.to(te_device)
+        t5xxl.to(te_device)
 
         text_encoder_caching_strategy = strategy_flux.FluxTextEncoderOutputsCachingStrategy(
             args.cache_text_encoder_outputs_to_disk, args.text_encoder_batch_size, False, False, args.apply_t5_attn_mask

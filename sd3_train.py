@@ -270,9 +270,16 @@ def train(args):
     # cache text encoder outputs
     sample_prompts_te_outputs = None
     if args.cache_text_encoder_outputs:
-        clip_l.to(accelerator.device)
-        clip_g.to(accelerator.device)
-        t5xxl.to(accelerator.device)
+        # Determine device for text encoder caching
+        if args.cache_text_encoder_outputs_on_cpu:
+            logger.info("cache text encoder outputs on CPU to reduce VRAM usage")
+            te_device = "cpu"
+        else:
+            te_device = accelerator.device
+        
+        clip_l.to(te_device)
+        clip_g.to(te_device)
+        t5xxl.to(te_device)
         clip_l.eval()
         clip_g.eval()
         t5xxl.eval()

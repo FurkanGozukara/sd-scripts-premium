@@ -214,10 +214,17 @@ class Sd3NetworkTrainer(train_network.NetworkTrainer):
                 clean_memory_on_device(accelerator.device)
 
             # When TE is not be trained, it will not be prepared so we need to use explicit autocast
-            logger.info("move text encoders to gpu")
-            text_encoders[0].to(accelerator.device, dtype=weight_dtype)  # always not fp8
-            text_encoders[1].to(accelerator.device, dtype=weight_dtype)  # always not fp8
-            text_encoders[2].to(accelerator.device)  # may be fp8
+            # Determine device for text encoder caching
+            if args.cache_text_encoder_outputs_on_cpu:
+                logger.info("cache text encoder outputs on CPU to reduce VRAM usage")
+                te_device = "cpu"
+            else:
+                logger.info("move text encoders to gpu")
+                te_device = accelerator.device
+            
+            text_encoders[0].to(te_device, dtype=weight_dtype)  # always not fp8
+            text_encoders[1].to(te_device, dtype=weight_dtype)  # always not fp8
+            text_encoders[2].to(te_device)  # may be fp8
 
             if text_encoders[2].dtype == torch.float8_e4m3fn:
                 # if we load fp8 weights, the model is already fp8, so we use it as is
@@ -255,15 +262,16 @@ class Sd3NetworkTrainer(train_network.NetworkTrainer):
 
             accelerator.wait_for_everyone()
 
-            # move back to cpu
-            if not self.is_train_text_encoder(args):
-                logger.info("move CLIP-L back to cpu")
-                text_encoders[0].to("cpu")
-                logger.info("move CLIP-G back to cpu")
-                text_encoders[1].to("cpu")
-            logger.info("move t5XXL back to cpu")
-            text_encoders[2].to("cpu")
-            clean_memory_on_device(accelerator.device)
+            # move back to cpu (if they were on GPU)
+            if not args.cache_text_encoder_outputs_on_cpu:
+                if not self.is_train_text_encoder(args):
+                    logger.info("move CLIP-L back to cpu")
+                    text_encoders[0].to("cpu")
+                    logger.info("move CLIP-G back to cpu")
+                    text_encoders[1].to("cpu")
+                logger.info("move t5XXL back to cpu")
+                text_encoders[2].to("cpu")
+                clean_memory_on_device(accelerator.device)
 
             if not args.lowram:
                 logger.info("move vae and unet back to original device")
