@@ -834,6 +834,7 @@ class SdxlUNet2DConditionModel(nn.Module):
         self.adm_in_channels = ADM_IN_CHANNELS
 
         self.gradient_checkpointing = False
+        self.blocks_to_swap = None
         # self.sample_size = sample_size
 
         # time embedding
@@ -1068,6 +1069,82 @@ class SdxlUNet2DConditionModel(nn.Module):
                 if hasattr(module, "gradient_checkpointing"):
                     # logger.info(f{module.__class__.__name__} {module.gradient_checkpointing} -> {value}")
                     module.gradient_checkpointing = value
+    
+    def enable_block_swap(self, num_blocks: int, device: torch.device):
+        """
+        Enable block swapping for SDXL UNet.
+        Swaps blocks between CPU and GPU to reduce memory usage.
+        
+        Args:
+            num_blocks: Total number of blocks to swap
+            device: The target device (GPU)
+        """
+        from library import custom_offloading_utils
+        
+        self.blocks_to_swap = num_blocks
+        
+        # SDXL has input_blocks (9), middle_block (1), output_blocks (9) = 19 blocks total
+        # We'll swap input_blocks and output_blocks, leaving middle_block on GPU
+        # We must keep at least 1 input block and 1 output block on GPU for the swap logic to work
+        max_input_swap = max(0, len(self.input_blocks) - 1)
+        max_output_swap = max(0, len(self.output_blocks) - 1)
+        total_swappable_blocks = max_input_swap + max_output_swap
+        
+        assert num_blocks <= total_swappable_blocks, (
+            f"Cannot swap more than {total_swappable_blocks} blocks (must keep at least 1 input and 1 output block on GPU). "
+            f"Requested {num_blocks} blocks."
+        )
+        
+        # Distribute blocks to swap between input and output blocks
+        # Swap from the end of input_blocks and beginning of output_blocks
+        input_blocks_to_swap = min(num_blocks, max_input_swap)
+        output_blocks_to_swap = min(num_blocks - input_blocks_to_swap, max_output_swap)
+        
+        # Verify we're swapping the correct number of blocks
+        assert input_blocks_to_swap + output_blocks_to_swap == num_blocks, (
+            f"Block swap calculation error: {input_blocks_to_swap} + {output_blocks_to_swap} != {num_blocks}"
+        )
+        
+        self.offloader_input = custom_offloading_utils.ModelOffloader(
+            self.input_blocks, input_blocks_to_swap, device
+        )
+        self.offloader_output = custom_offloading_utils.ModelOffloader(
+            self.output_blocks, output_blocks_to_swap, device
+        )
+        
+        logger.info(
+            f"SDXL: Block swap enabled. Swapping {num_blocks} blocks total, "
+            f"input blocks: {input_blocks_to_swap}, output blocks: {output_blocks_to_swap}."
+        )
+    
+    def move_to_device_except_swap_blocks(self, device: torch.device):
+        """
+        Move model to device except blocks that will be swapped.
+        This reduces peak memory usage during model loading.
+        """
+        if self.blocks_to_swap:
+            # Temporarily remove blocks that will be swapped
+            save_input_blocks = self.input_blocks
+            save_output_blocks = self.output_blocks
+            self.input_blocks = None
+            self.output_blocks = None
+        
+        self.to(device)
+        
+        if self.blocks_to_swap:
+            # Restore the blocks
+            self.input_blocks = save_input_blocks
+            self.output_blocks = save_output_blocks
+    
+    def prepare_block_swap_before_forward(self):
+        """
+        Prepare block devices before forward pass.
+        Sets up which blocks should be on GPU and which on CPU.
+        """
+        if self.blocks_to_swap is None or self.blocks_to_swap == 0:
+            return
+        self.offloader_input.prepare_block_devices_before_forward(self.input_blocks)
+        self.offloader_output.prepare_block_devices_before_forward(self.output_blocks)
 
     # endregion
 
@@ -1142,15 +1219,27 @@ class SdxlUNet2DConditionModel(nn.Module):
         # h = x.type(self.dtype)
         h = x
 
-        for module in self.input_blocks:
+        for block_idx, module in enumerate(self.input_blocks):
+            if self.blocks_to_swap:
+                self.offloader_input.wait_for_block(block_idx)
+            
             h = call_module(module, h, emb, context)
             hs.append(h)
+            
+            if self.blocks_to_swap:
+                self.offloader_input.submit_move_blocks(self.input_blocks, block_idx)
 
         h = call_module(self.middle_block, h, emb, context)
 
-        for module in self.output_blocks:
+        for block_idx, module in enumerate(self.output_blocks):
+            if self.blocks_to_swap:
+                self.offloader_output.wait_for_block(block_idx)
+            
             h = torch.cat([h, hs.pop()], dim=1)
             h = call_module(module, h, emb, context)
+            
+            if self.blocks_to_swap:
+                self.offloader_output.submit_move_blocks(self.output_blocks, block_idx)
 
         h = h.type(x.dtype)
         h = call_module(self.out, h, emb, context)
@@ -1233,6 +1322,8 @@ class InferSdxlUNet2DConditionModel:
         h = x
 
         for depth, module in enumerate(_self.input_blocks):
+            if _self.blocks_to_swap:
+                _self.offloader_input.wait_for_block(depth)
             # Deep Shrink
             if self.ds_depth_1 is not None:
                 if (depth == self.ds_depth_1 and timesteps[0] >= self.ds_timesteps_1) or (
@@ -1249,12 +1340,17 @@ class InferSdxlUNet2DConditionModel:
 
             h = call_module(module, h, emb, context)
             hs.append(h)
+            
+            if _self.blocks_to_swap:
+                _self.offloader_input.submit_move_blocks(_self.input_blocks, depth)
 
         h = call_module(_self.middle_block, h, emb, context)
         if mid_add is not None:
             h = h + mid_add
 
-        for module in _self.output_blocks:
+        for block_idx, module in enumerate(_self.output_blocks):
+            if _self.blocks_to_swap:
+                _self.offloader_output.wait_for_block(block_idx)
             # Deep Shrink
             if self.ds_depth_1 is not None:
                 if hs[-1].shape[-2:] != h.shape[-2:]:
@@ -1267,6 +1363,9 @@ class InferSdxlUNet2DConditionModel:
 
             h = torch.cat([h, resi], dim=1)
             h = call_module(module, h, emb, context)
+            
+            if _self.blocks_to_swap:
+                _self.offloader_output.submit_move_blocks(_self.output_blocks, block_idx)
 
         # Deep Shrink: in case of depth 0
         if self.ds_depth_1 == 0 and h.shape[-2:] != x.shape[-2:]:

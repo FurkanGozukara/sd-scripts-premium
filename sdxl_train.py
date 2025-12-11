@@ -100,6 +100,14 @@ def train(args):
     train_util.verify_training_args(args)
     train_util.prepare_dataset_args(args, True)
     sdxl_train_util.verify_sdxl_training_args(args)
+    
+    # Verify blocks_to_swap compatibility
+    if hasattr(args, 'blocks_to_swap') and args.blocks_to_swap and args.blocks_to_swap > 0:
+        if not (args.fused_backward_pass or (hasattr(args, 'blockwise_fused_optimizers') and args.blockwise_fused_optimizers)):
+            logger.warning(
+                "blocks_to_swap is set but neither fused_backward_pass nor blockwise_fused_optimizers is enabled. "
+                "Block swap works best with fused_backward_pass. Proceeding anyway, but you may want to enable it."
+            )
     deepspeed_utils.prepare_deepspeed_args(args)
     setup_logging(args, reset=True)
 
@@ -491,29 +499,114 @@ def train(args):
         training_models = [ds_model]
 
     else:
+        # Check if block swapping is enabled (before preparing models)
+        blocks_to_swap_count = args.blocks_to_swap if hasattr(args, 'blocks_to_swap') and args.blocks_to_swap else 0
+        is_swapping_blocks = blocks_to_swap_count > 0
+        
         # acceleratorがなんかよろしくやってくれるらしい
         if train_unet:
-            unet = accelerator.prepare(unet)
             
-            # Compile UNet blocks if requested
-            if args.compile and train_unet:
-                logger.info("Compiling UNet blocks with torch.compile")
+            if not is_swapping_blocks:
+                # Standard path without block swapping
+                unet = accelerator.prepare(unet)
+
+                # Compile UNet blocks if requested
+                if args.compile:
+                    logger.info("Compiling SDXL UNet blocks with torch.compile")
+                    unwrapped_unet = accelerator.unwrap_model(unet)
+                    # Get all block lists for SDXL UNet
+                    target_blocks = [
+                        unwrapped_unet.input_blocks,
+                        unwrapped_unet.output_blocks,
+                        [unwrapped_unet.middle_block]
+                    ]
+                    unet = compile_utils.compile_model(
+                        args, 
+                        unet, 
+                        target_blocks, 
+                        disable_linear=False,
+                        log_prefix="SDXL UNet"
+                    )
+                    # Add _orig_mod reference for accelerator compatibility
+                    unet.__dict__["_orig_mod"] = unet
+            else:
+                # Block swapping path using OneTrainer-style approach
+                logger.info(f"Setting up SDXL UNet with OneTrainer-style block swap: {blocks_to_swap_count} blocks")
+                
+                # Import our SDXL offloading utilities
+                import library.sdxl_offloading_utils as sdxl_offloading_utils
+                
+                # Get UNet structure info
+                logger.info(f"SDXL UNet structure: {len(unet.input_blocks)} input blocks, "
+                           f"1 middle block, {len(unet.output_blocks)} output blocks")
+                
+                # Collect transformer blocks for OneTrainer-style swapping
+                transformer_blocks = sdxl_offloading_utils.collect_transformer_blocks_from_unet(unet)
+                logger.info(f"Found {len(transformer_blocks)} transformer blocks to manage")
+                
+                # Validate blocks_to_swap
+                max_swappable = max(0, len(transformer_blocks) - 2)
+                if blocks_to_swap_count > max_swappable:
+                    logger.warning(f"Requested {blocks_to_swap_count} blocks to swap, but only "
+                                  f"{max_swappable} can be safely swapped.")
+                    blocks_to_swap_count = min(blocks_to_swap_count, max_swappable)
+                
+                if args.gradient_checkpointing:
+                    logger.info("Gradient checkpointing stays enabled with SDXL block swap.")
+                
+                logger.info(f"Will swap {blocks_to_swap_count} transformer blocks using backward hooks")
+
+                # To avoid an initial full-GPU load, place only the needed parts of UNet on device
+                # before wrapping with Accelerator. This is only done for single-process runs.
+                manual_device_placement = accelerator.num_processes == 1
+                if manual_device_placement:
+                    sdxl_offloading_utils.place_unet_for_block_swap(
+                        unet,
+                        transformer_blocks,
+                        blocks_to_swap_count,
+                        accelerator.device,
+                        debug=getattr(args, 'debug', False),
+                    )
+
+                # Prepare with accelerator. Keep device placement manual when block swap is active.
+                if manual_device_placement:
+                    unet = accelerator.prepare_model(unet, device_placement=False)
+                else:
+                    # Multi-process/DDP path: fall back to default placement, then offload blocks.
+                    unet = accelerator.prepare(unet)
+
+                # Use the wrapped model for training but operate on the unwrapped instance for hooks.
                 unwrapped_unet = accelerator.unwrap_model(unet)
-                # Get all block lists for SDXL UNet
-                target_blocks = [
-                    unwrapped_unet.down_blocks,
-                    unwrapped_unet.up_blocks,
-                    [unwrapped_unet.mid_block]  # mid_block is a single module, wrap in list
-                ]
-                unet = compile_utils.compile_model(
-                    args, 
-                    unet, 
-                    target_blocks, 
-                    disable_linear=False,
-                    log_prefix="SDXL UNet"
+
+                # If we couldn't manually place (e.g., multi-process), offload blocks now.
+                if not manual_device_placement:
+                    sdxl_offloading_utils.place_unet_for_block_swap(
+                        unwrapped_unet,
+                        sdxl_offloading_utils.collect_transformer_blocks_from_unet(unwrapped_unet),
+                        blocks_to_swap_count,
+                        accelerator.device,
+                        debug=getattr(args, 'debug', False),
+                    )
+
+                # Enable OneTrainer-style block swap
+                swap_manager = sdxl_offloading_utils.enable_block_swap_for_sdxl_unet(
+                    unwrapped_unet,
+                    blocks_to_swap_count,
+                    accelerator.device,
+                    debug=getattr(args, 'debug', False)
                 )
-                # Add _orig_mod reference for accelerator compatibility
-                unet.__dict__["_orig_mod"] = unet
+                
+                # Prepare block devices for initial forward pass
+                if hasattr(unwrapped_unet, 'block_swap_manager'):
+                    unwrapped_unet.block_swap_manager.prepare_block_swap_before_forward()
+                    logger.info("OneTrainer-style block swap initialized successfully")
+                
+                # Note: Compilation is not recommended with block swapping
+                if args.compile:
+                    logger.warning(
+                        "torch.compile with block swapping is experimental and may cause issues. "
+                        "Skipping compilation for block-swapped UNet."
+                    )
                 
         if train_text_encoder1:
             text_encoder1 = accelerator.prepare(text_encoder1)
@@ -793,6 +886,12 @@ def train(args):
                     [text_encoder1, text_encoder2],
                     unet,
                 )
+                
+                # Prepare for next forward if using block swap
+                if is_swapping_blocks:
+                    unwrapped = accelerator.unwrap_model(unet)
+                    if hasattr(unwrapped, 'block_swap_manager'):
+                        unwrapped.block_swap_manager.prepare_block_swap_before_forward()
 
                 # 指定ステップごとにモデルを保存
                 if args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0:

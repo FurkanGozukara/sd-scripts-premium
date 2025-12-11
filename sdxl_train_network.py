@@ -22,6 +22,7 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
         super().__init__()
         self.vae_scale_factor = sdxl_model_util.VAE_SCALE_FACTOR
         self.is_sdxl = True
+        self.is_swapping_blocks = False
 
     def assert_extra_args(
         self,
@@ -39,6 +40,14 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
         assert (
             args.network_train_unet_only or not args.cache_text_encoder_outputs
         ), "network for Text Encoder cannot be trained with caching Text Encoder outputs / Text Encoderの出力をキャッシュしながらText Encoderのネットワークを学習することはできません"
+
+        # Verify blocks_to_swap compatibility
+        if hasattr(args, 'blocks_to_swap') and args.blocks_to_swap and args.blocks_to_swap > 0:
+            if not (args.fused_backward_pass or (hasattr(args, 'blockwise_fused_optimizers') and args.blockwise_fused_optimizers)):
+                logger.warning(
+                    "blocks_to_swap is set but neither fused_backward_pass nor blockwise_fused_optimizers is enabled. "
+                    "Block swap works best with fused_backward_pass. Proceeding anyway, but you may want to enable it."
+                )
 
         train_dataset_group.verify_bucket_reso_steps(32)
         if val_dataset_group is not None:
@@ -215,36 +224,119 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
 
     def sample_images(self, accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet):
         sdxl_train_util.sample_images(accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet)
+    
+    def on_validation_step_end(self, args, accelerator, network, text_encoders, unet, batch, weight_dtype):
+        """
+        Called after validation step. Used to prepare block swap for next forward pass.
+        """
+        if self.is_swapping_blocks:
+            # Prepare for next forward: because backward pass is not called during validation,
+            # we need to prepare block swap here
+            unwrapped = accelerator.unwrap_model(unet)
+            if hasattr(unwrapped, 'block_swap_manager'):
+                unwrapped.block_swap_manager.prepare_block_swap_before_forward()
 
     def prepare_unet_with_accelerator(
         self, args: argparse.Namespace, accelerator: Accelerator, unet: torch.nn.Module
     ) -> torch.nn.Module:
         """
-        Prepare UNet with accelerator and optionally compile it.
+        Prepare UNet with accelerator, optionally with block swap and/or compile.
         """
-        # First prepare with accelerator
-        unet = super().prepare_unet_with_accelerator(args, accelerator, unet)
+        # Check if block swapping is enabled
+        blocks_to_swap_count = args.blocks_to_swap if hasattr(args, 'blocks_to_swap') and args.blocks_to_swap else 0
+        self.is_swapping_blocks = blocks_to_swap_count > 0
         
-        # Then compile if requested
-        if hasattr(args, 'compile') and args.compile:
-            logger.info("Compiling SDXL UNet blocks with torch.compile")
-            unwrapped_unet = accelerator.unwrap_model(unet)
-            # Get all block lists for SDXL UNet
-            target_blocks = [
-                unwrapped_unet.down_blocks,
-                unwrapped_unet.up_blocks,
-                [unwrapped_unet.mid_block]  # mid_block is a single module, wrap in list
-            ]
-            unet = compile_utils.compile_model(
-                args,
-                unet,
-                target_blocks,
-                disable_linear=False,
-                log_prefix="SDXL UNet (LoRA)"
-            )
-            # Add _orig_mod reference for accelerator compatibility
-            unet.__dict__["_orig_mod"] = unet
+        if not self.is_swapping_blocks:
+            # Standard path without block swapping
+            unet = super().prepare_unet_with_accelerator(args, accelerator, unet)
             
+            # Then compile if requested
+            if hasattr(args, 'compile') and args.compile:
+                logger.info("Compiling SDXL UNet blocks with torch.compile")
+                unwrapped_unet = accelerator.unwrap_model(unet)
+                # Get all block lists for SDXL UNet
+                target_blocks = [
+                    unwrapped_unet.input_blocks,
+                    unwrapped_unet.output_blocks,
+                    [unwrapped_unet.middle_block]  # middle_block is a list of modules, but treat as single block
+                ]
+                unet = compile_utils.compile_model(
+                    args,
+                    unet,
+                    target_blocks,
+                    disable_linear=False,
+                    log_prefix="SDXL UNet (LoRA)"
+                )
+                # Add _orig_mod reference for accelerator compatibility
+                unet.__dict__["_orig_mod"] = unet
+            
+            return unet
+        
+        # Block swapping path using OneTrainer-style approach
+        logger.info(f"Setting up SDXL UNet with OneTrainer-style block swap: {blocks_to_swap_count} blocks")
+        
+        # Block swapping works best with gradient checkpointing
+        if args.gradient_checkpointing:
+            logger.info("Enabling gradient checkpointing with block swapping.")
+        else:
+            logger.warning("Gradient checkpointing is disabled properly. VRAM usage optimization by block move will be limited.")
+
+        # Import our SDXL offloading utilities
+        import library.sdxl_offloading_utils as sdxl_offloading_utils
+        
+        # Get UNet structure info
+        logger.info(f"SDXL UNet structure: {len(unet.input_blocks)} input blocks, "
+                   f"1 middle block, {len(unet.output_blocks)} output blocks")
+        
+        # Collect transformer blocks for OneTrainer-style swapping
+        transformer_blocks = sdxl_offloading_utils.collect_transformer_blocks_from_unet(unet)
+        logger.info(f"Found {len(transformer_blocks)} transformer blocks to manage")
+        
+        # Validate blocks_to_swap
+        max_swappable = max(0, len(transformer_blocks) - 2)
+        if blocks_to_swap_count > max_swappable:
+            logger.warning(f"Requested {blocks_to_swap_count} blocks to swap, but only "
+                          f"{max_swappable} can be safely swapped.")
+            blocks_to_swap_count = min(blocks_to_swap_count, max_swappable)
+        
+        logger.info(f"Will swap {blocks_to_swap_count} transformer blocks using backward hooks")
+        
+        # Enable OneTrainer-style block swap
+        swap_manager = sdxl_offloading_utils.enable_block_swap_for_sdxl_unet(
+            unet,
+            blocks_to_swap_count,
+            accelerator.device,
+            debug=getattr(args, 'debug', False)
+        )
+        
+        # Prepare with accelerator - let accelerator handle device placement
+        # For block swap, we MUST disable automatic device placement to avoid loading the whole model to GPU
+        unet = accelerator.prepare(unet, device_placement=False)
+        
+        # Manually place the model parts:
+        # 1. Unwrapped UNet (inner model)
+        unwrapped_unet = accelerator.unwrap_model(unet)
+        
+        # 2. Use our utility to place everything correctly (kept blocks -> GPU, swapped blocks -> CPU, others -> GPU)
+        sdxl_offloading_utils.place_unet_for_block_swap(
+            unwrapped_unet, 
+            transformer_blocks, 
+            blocks_to_swap_count, 
+            accelerator.device
+        )
+        
+        # Prepare block devices for initial forward pass (this might be redundant if place_unet_for_block_swap did it, but safe)
+        if hasattr(unwrapped_unet, 'block_swap_manager'):
+            unwrapped_unet.block_swap_manager.prepare_block_swap_before_forward()
+            logger.info("OneTrainer-style block swap initialized successfully")
+        
+        # Note: Compilation is not recommended with block swapping
+        if hasattr(args, 'compile') and args.compile:
+            logger.warning(
+                "torch.compile with block swapping is experimental and may cause issues. "
+                "Skipping compilation for block-swapped UNet."
+            )
+        
         return unet
 
 

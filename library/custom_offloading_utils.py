@@ -32,7 +32,9 @@ def _synchronize_device(device: torch.device):
 
 
 def swap_weight_devices_cuda(device: torch.device, layer_to_cpu: nn.Module, layer_to_cuda: nn.Module):
-    assert layer_to_cpu.__class__ == layer_to_cuda.__class__
+    # Note: layer_to_cpu and layer_to_cuda may have different container types (e.g., Sequential vs ModuleList)
+    # This is fine as long as the internal modules match by name and shape
+    # assert layer_to_cpu.__class__ == layer_to_cuda.__class__
 
     weight_swap_jobs: list[Tuple[nn.Module, nn.Module, torch.Tensor, torch.Tensor]] = []
 
@@ -43,17 +45,16 @@ def swap_weight_devices_cuda(device: torch.device, layer_to_cpu: nn.Module, laye
     #         weight_swap_jobs.append((module_to_cpu, module_to_cuda, module_to_cpu.weight.data, module_to_cuda.weight.data))
 
     modules_to_cpu = {k: v for k, v in layer_to_cpu.named_modules()}
+    modules_to_cuda_without_match = []
+    
     for module_to_cuda_name, module_to_cuda in layer_to_cuda.named_modules():
         if hasattr(module_to_cuda, "weight") and module_to_cuda.weight is not None:
             module_to_cpu = modules_to_cpu.get(module_to_cuda_name, None)
             if module_to_cpu is not None and module_to_cpu.weight.shape == module_to_cuda.weight.shape:
                 weight_swap_jobs.append((module_to_cpu, module_to_cuda, module_to_cpu.weight.data, module_to_cuda.weight.data))
             else:
-                if module_to_cuda.weight.data.device.type != device.type:
-                    # print(
-                    #     f"Module {module_to_cuda_name} not found in CPU model or shape mismatch, so not swapping and moving to device"
-                    # )
-                    module_to_cuda.weight.data = module_to_cuda.weight.data.to(device)
+                # No matching module in CPU layer, or shape mismatch - will move to device separately
+                modules_to_cuda_without_match.append(module_to_cuda)
 
     torch.cuda.current_stream().synchronize()  # this prevents the illegal loss value
 
@@ -73,18 +74,42 @@ def swap_weight_devices_cuda(device: torch.device, layer_to_cpu: nn.Module, laye
 
     stream.synchronize()
     torch.cuda.current_stream().synchronize()  # this prevents the illegal loss value
+    
+    # Move unmatched modules to device (for blocks with different structures)
+    for module_to_cuda in modules_to_cuda_without_match:
+        if module_to_cuda.weight.data.device.type != device.type:
+            module_to_cuda.weight.data = module_to_cuda.weight.data.to(device, non_blocking=True)
+    
+    # Also move CPU layer weights to CPU (if not already matched)
+    modules_moved_to_cpu = {id(m) for m, _, _, _ in weight_swap_jobs}
+    for module_name, module_to_cpu in layer_to_cpu.named_modules():
+        if hasattr(module_to_cpu, "weight") and module_to_cpu.weight is not None:
+            if id(module_to_cpu) not in modules_moved_to_cpu and module_to_cpu.weight.data.device.type == device.type:
+                module_to_cpu.weight.data = module_to_cpu.weight.data.to("cpu", non_blocking=True)
+    
+    torch.cuda.current_stream().synchronize()
 
 
 def swap_weight_devices_no_cuda(device: torch.device, layer_to_cpu: nn.Module, layer_to_cuda: nn.Module):
     """
     not tested
     """
-    assert layer_to_cpu.__class__ == layer_to_cuda.__class__
+    # Note: layer_to_cpu and layer_to_cuda may have different container types (e.g., Sequential vs ModuleList)
+    # This is fine as long as the internal modules match by name and shape
+    # assert layer_to_cpu.__class__ == layer_to_cuda.__class__
 
     weight_swap_jobs: list[Tuple[nn.Module, nn.Module, torch.Tensor, torch.Tensor]] = []
-    for module_to_cpu, module_to_cuda in zip(layer_to_cpu.modules(), layer_to_cuda.modules()):
-        if hasattr(module_to_cpu, "weight") and module_to_cpu.weight is not None:
-            weight_swap_jobs.append((module_to_cpu, module_to_cuda, module_to_cpu.weight.data, module_to_cuda.weight.data))
+    modules_to_cpu = {k: v for k, v in layer_to_cpu.named_modules()}
+    modules_to_cuda_without_match = []
+    
+    for module_to_cuda_name, module_to_cuda in layer_to_cuda.named_modules():
+        if hasattr(module_to_cuda, "weight") and module_to_cuda.weight is not None:
+            module_to_cpu = modules_to_cpu.get(module_to_cuda_name, None)
+            if module_to_cpu is not None and module_to_cpu.weight.shape == module_to_cuda.weight.shape:
+                weight_swap_jobs.append((module_to_cpu, module_to_cuda, module_to_cpu.weight.data, module_to_cuda.weight.data))
+            else:
+                # No matching module in CPU layer, or shape mismatch - will move to device separately
+                modules_to_cuda_without_match.append(module_to_cuda)
 
     # device to cpu
     for module_to_cpu, module_to_cuda, cuda_data_view, cpu_data_view in weight_swap_jobs:
@@ -96,6 +121,20 @@ def swap_weight_devices_no_cuda(device: torch.device, layer_to_cpu: nn.Module, l
     for module_to_cpu, module_to_cuda, cuda_data_view, cpu_data_view in weight_swap_jobs:
         cuda_data_view.copy_(module_to_cuda.weight.data, non_blocking=True)
         module_to_cuda.weight.data = cuda_data_view
+
+    _synchronize_device(device)
+    
+    # Move unmatched modules to device (for blocks with different structures)
+    for module_to_cuda in modules_to_cuda_without_match:
+        if module_to_cuda.weight.data.device.type != device.type:
+            module_to_cuda.weight.data = module_to_cuda.weight.data.to(device, non_blocking=True)
+    
+    # Also move CPU layer weights to CPU (if not already matched)
+    modules_moved_to_cpu = {id(m) for m, _, _, _ in weight_swap_jobs}
+    for module_name, module_to_cpu in layer_to_cpu.named_modules():
+        if hasattr(module_to_cpu, "weight") and module_to_cpu.weight is not None:
+            if id(module_to_cpu) not in modules_moved_to_cpu and module_to_cpu.weight.data.device.type == device.type:
+                module_to_cpu.weight.data = module_to_cpu.weight.data.to("cpu", non_blocking=True)
 
     _synchronize_device(device)
 
