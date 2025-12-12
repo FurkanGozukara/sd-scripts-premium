@@ -409,3 +409,5 @@ def get_sdxl_block_info(unet: nn.Module) -> dict:
             'unet_type': 'diffusers',
         }
 
+
+

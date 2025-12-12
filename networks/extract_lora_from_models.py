@@ -173,8 +173,8 @@ def svd(
     lora_weights = {}
     with torch.no_grad():
         for lora_name, mat in tqdm(list(diffs.items())):
-            if args.device:
-                mat = mat.to(args.device)
+            if device:
+                mat = mat.to(device)
             mat = mat.to(torch.float)  # calc by float
 
             # if conv_dim is None, diffs do not include LoRAs for conv2d-3x3
@@ -197,7 +197,41 @@ def svd(
                 else:
                     mat = mat.squeeze()
 
-            U, S, Vh = torch.linalg.svd(mat)
+            # Use CPU for SVD as it's more stable and reliable than CUDA for ill-conditioned matrices
+            # CUDA cusolver can hang or fail on certain matrices, while CPU LAPACK handles them better
+            svd_success = False
+            original_device = mat.device
+            U, S, Vh = None, None, None
+            
+            try:
+                # Perform SVD on CPU (more stable for ill-conditioned matrices)
+                mat_cpu = mat.cpu()
+                U, S, Vh = torch.linalg.svd(mat_cpu, full_matrices=False)
+                # Move results back to original device if needed
+                if original_device.type != 'cpu':
+                    U = U.to(original_device)
+                    S = S.to(original_device)
+                    Vh = Vh.to(original_device)
+                svd_success = True
+            except (torch._C._LinAlgError, RuntimeError) as e:
+                logger.warning(f"CPU SVD failed for {lora_name}, trying with noise stabilization: {e}")
+                try:
+                    # Add small noise to stabilize ill-conditioned matrix
+                    mat_stabilized = mat_cpu + torch.randn_like(mat_cpu) * 1e-6
+                    U, S, Vh = torch.linalg.svd(mat_stabilized, full_matrices=False)
+                    # Move results back to original device if needed
+                    if original_device.type != 'cpu':
+                        U = U.to(original_device)
+                        S = S.to(original_device)
+                        Vh = Vh.to(original_device)
+                    svd_success = True
+                    logger.info(f"SVD successful for {lora_name} using noise stabilization")
+                except (torch._C._LinAlgError, RuntimeError) as e2:
+                    logger.warning(f"All SVD approaches failed for {lora_name}: {e2}")
+                    logger.warning(f"Skipping layer {lora_name}")
+            
+            if not svd_success:
+                continue
 
             U = U[:, :rank]
             S = S[:rank]
