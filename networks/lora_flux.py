@@ -1033,6 +1033,44 @@ class LoRANetwork(torch.nn.Module):
         return info
 
     def load_state_dict(self, state_dict, strict=True):
+        # Convert ComfyUI-compatible keys back to internal format
+        # Input: text_encoders.clip_l.transformer.text_model.encoder.layers.0.mlp.fc1 (with dots, ComfyUI format)
+        # Internal: lora_te1_text_model_encoder_layers_0_mlp_fc1 (with underscores, PyTorch compatible)
+        converted_state_dict = {}
+        for key in list(state_dict.keys()):
+            new_key = key
+            # Check if this is a ComfyUI-format CLIP-L text encoder key
+            if key.startswith("text_encoders.clip_l.transformer.text_model."):
+                # Extract the part after text_encoders.clip_l.transformer.
+                suffix = key[len("text_encoders.clip_l.transformer."):]
+                # Convert dots to underscores in the module path
+                # But keep the final part (alpha, lora_down.weight, lora_up.weight, etc.) intact
+                if ".alpha" in suffix:
+                    module_path = suffix[:-len(".alpha")]
+                    converted_module_path = module_path.replace(".", "_")
+                    new_key = f"lora_te1_{converted_module_path}.alpha"
+                elif ".lora_down.weight" in suffix:
+                    module_path = suffix[:-len(".lora_down.weight")]
+                    converted_module_path = module_path.replace(".", "_")
+                    new_key = f"lora_te1_{converted_module_path}.lora_down.weight"
+                elif ".lora_up.weight" in suffix:
+                    module_path = suffix[:-len(".lora_up.weight")]
+                    converted_module_path = module_path.replace(".", "_")
+                    new_key = f"lora_te1_{converted_module_path}.lora_up.weight"
+                elif ".lora_down." in suffix:  # split qkv case
+                    parts = suffix.split(".lora_down.")
+                    module_path = parts[0]
+                    converted_module_path = module_path.replace(".", "_")
+                    new_key = f"lora_te1_{converted_module_path}.lora_down.{parts[1]}"
+                elif ".lora_up." in suffix:  # split qkv case
+                    parts = suffix.split(".lora_up.")
+                    module_path = parts[0]
+                    converted_module_path = module_path.replace(".", "_")
+                    new_key = f"lora_te1_{converted_module_path}.lora_up.{parts[1]}"
+            converted_state_dict[new_key] = state_dict[key]
+
+        state_dict = converted_state_dict
+
         # override to convert original weight to split qkv
         if not self.split_qkv:
             return super().load_state_dict(state_dict, strict)
@@ -1346,11 +1384,24 @@ class LoRANetwork(torch.nn.Module):
 
         state_dict = self.state_dict()
 
+        # NOTE: ComfyUI supports both formats for CLIP-L text encoder keys:
+        # 1. lora_te1_text_model_encoder_layers_0_mlp_fc1 (internal format with underscores)
+        # 2. text_encoders.clip_l.transformer.text_model.encoder.layers.0.mlp.fc1 (with dots)
+        # We'll use format 1 (lora_te1_*) as it's more widely compatible and doesn't require conversion
+        # This format is natively supported by ComfyUI and matches the internal representation
+        # No key conversion needed - keeping original lora_te1_* keys
+
         if dtype is not None:
             for key in list(state_dict.keys()):
                 v = state_dict[key]
                 v = v.detach().clone().to("cpu").to(dtype)
                 state_dict[key] = v
+
+        # Free up memory before hash calculation
+        import gc
+        import torch
+        gc.collect()
+        torch.cuda.empty_cache()
 
         if os.path.splitext(file)[1] == ".safetensors":
             from safetensors.torch import save_file
@@ -1359,9 +1410,15 @@ class LoRANetwork(torch.nn.Module):
             # Precalculate model hashes to save time on indexing
             if metadata is None:
                 metadata = {}
-            model_hash, legacy_hash = train_util.precalculate_safetensors_hashes(state_dict, metadata)
-            metadata["sshs_model_hash"] = model_hash
-            metadata["sshs_legacy_hash"] = legacy_hash
+
+            # Skip hash calculation if it causes memory issues - hashes can be calculated later if needed
+            try:
+                model_hash, legacy_hash = train_util.precalculate_safetensors_hashes(state_dict, metadata)
+                metadata["sshs_model_hash"] = model_hash
+                metadata["sshs_legacy_hash"] = legacy_hash
+            except (MemoryError, RuntimeError) as e:
+                print(f"Warning: Could not precalculate hashes due to memory constraints: {e}")
+                print("Saving without hash metadata...")
 
             save_file(state_dict, file, metadata)
         else:
