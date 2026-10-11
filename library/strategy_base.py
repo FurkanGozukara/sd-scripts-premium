@@ -20,6 +20,43 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _ensure_sentencepiece_proto_compat() -> None:
+    """transformers 5 converts spiece.model-only tokenizers (e.g. google/t5-v1_1-xxl) to fast tokenizers by
+    parsing the SentencePiece proto with sentencepiece's generated pb2 module, which needs protobuf>=3.20
+    (google.protobuf.internal.builder). When that import fails (protobuf 3.19 is pinned by other packages), fall back
+    to the protobuf-3 compatible copy shipped in transformers.utils, so T5 tokenizers still load.
+    """
+    try:
+        from sentencepiece import sentencepiece_model_pb2  # noqa: F401
+
+        return
+    except Exception:
+        pass
+    try:
+        import importlib
+
+        # importlib: `import transformers.convert_slow_tokenizer as x` returns the lazily exported function of the same name
+        convert_slow_tokenizer = importlib.import_module("transformers.convert_slow_tokenizer")
+        from transformers.utils import sentencepiece_model_pb2 as legacy_sentencepiece_model_pb2
+    except Exception:
+        return
+    original_import_protobuf = getattr(convert_slow_tokenizer, "import_protobuf", None)
+    if original_import_protobuf is None or getattr(original_import_protobuf, "_sd_scripts_compat", False):
+        return
+
+    def import_protobuf(error_message=""):
+        try:
+            return original_import_protobuf(error_message)
+        except ImportError:
+            return legacy_sentencepiece_model_pb2
+
+    import_protobuf._sd_scripts_compat = True
+    convert_slow_tokenizer.import_protobuf = import_protobuf
+
+
+_ensure_sentencepiece_proto_compat()
+
+
 class TokenizeStrategy:
     _strategy = None  # strategy instance: actual strategy class
 

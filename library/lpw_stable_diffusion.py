@@ -9,7 +9,12 @@ import numpy as np
 import PIL.Image
 import torch
 from packaging import version
-from transformers import CLIPFeatureExtractor, CLIPTextModel, CLIPTokenizer, CLIPVisionModelWithProjection
+from transformers import CLIPTextModel, CLIPTokenizer, CLIPVisionModelWithProjection
+
+try:
+    from transformers import CLIPFeatureExtractor
+except ImportError:  # transformers 5 removed the deprecated alias; CLIPImageProcessor is the same class
+    from transformers import CLIPImageProcessor as CLIPFeatureExtractor
 
 import diffusers
 from diffusers import SchedulerMixin, StableDiffusionPipeline

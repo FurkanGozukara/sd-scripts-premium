@@ -19,6 +19,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 from library import flux_models
+from library.transformers_compat import clip_text_model_from_config
 from library.safetensors_utils import load_safetensors
 
 MODEL_VERSION_FLUX_V1 = "flux1"
@@ -402,7 +403,7 @@ def load_clip_l(
     }
     config = CLIPConfig(**CLIPL_CONFIG)
     with init_empty_weights():
-        clip = CLIPTextModel._from_config(config)
+        clip = clip_text_model_from_config(config)  # transformers 4 layout (text_model.*) on transformers 5 too
 
     if state_dict is not None:
         sd = state_dict

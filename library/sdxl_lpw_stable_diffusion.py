@@ -10,7 +10,12 @@ import PIL.Image
 import torch
 from packaging import version
 from tqdm import tqdm
-from transformers import CLIPFeatureExtractor, CLIPTextModel, CLIPTokenizer
+from transformers import CLIPTextModel, CLIPTokenizer
+
+try:
+    from transformers import CLIPFeatureExtractor
+except ImportError:  # transformers 5 removed the deprecated alias; CLIPImageProcessor is the same class
+    from transformers import CLIPImageProcessor as CLIPFeatureExtractor
 
 from diffusers import SchedulerMixin, StableDiffusionPipeline
 from diffusers.models import AutoencoderKL

@@ -8,6 +8,7 @@ from typing import List
 from diffusers import AutoencoderKL, EulerDiscreteScheduler, UNet2DConditionModel
 from library import model_util
 from library import sdxl_original_unet
+from library.transformers_compat import clip_text_model_from_config
 from library.utils import setup_logging
 
 setup_logging()
@@ -233,7 +234,7 @@ def load_models_from_sdxl_checkpoint(model_version, ckpt_path, map_location, dty
         # transformers_version="4.25.0.dev0",
     )
     with init_empty_weights():
-        text_model1 = CLIPTextModel._from_config(text_model1_cfg)
+        text_model1 = clip_text_model_from_config(text_model1_cfg)  # transformers 4 layout (text_model.*) on transformers 5 too
 
     # Text Encoder 2 is different from Stability AI's SDXL. SDXL uses open clip, but we use the model from HuggingFace.
     # Note: Tokenizer from HuggingFace is different from SDXL. We must use open clip's tokenizer.
