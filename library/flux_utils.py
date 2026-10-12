@@ -159,8 +159,10 @@ def load_flow_model(
         if fp8_scaled:
             # fp8 optimization: calculate on device, move to loading_device (CPU for block swap, GPU otherwise)
             logger.info("Optimizing model weights to fp8. This may take a while.")
-            # Fixed: move_to_device should be True when loading_device is CPU (to move from calc device back to CPU)
-            sd = model.fp8_optimization(sd, device, move_to_device=(loading_device.type == "cpu"), use_scaled_mm=use_scaled_mm)
+            # move_to_device=True keeps each quantized weight on the calc device; with block swap (loading_device CPU) every
+            # weight goes back to the CPU, or the whole FP8 model sits on the GPU before the swap starts (a 10.7 GB load
+            # peak for the 6 GB FP8 preset, which then trains in 5 GB)
+            sd = model.fp8_optimization(sd, device, move_to_device=(loading_device.type != "cpu"), use_scaled_mm=use_scaled_mm)
 
             if loading_device.type != "cpu":
                 # make sure all the model weights are on the loading_device
