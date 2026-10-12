@@ -12,6 +12,7 @@ import numpy as np
 import torch
 import re
 from library.utils import setup_logging
+from networks.dora import dora_class, has_dora_weights, is_true, saved_dtype
 from library.sdxl_original_unet import SdxlUNet2DConditionModel
 
 setup_logging()
@@ -473,10 +474,17 @@ def create_network(
     if module_dropout is not None:
         module_dropout = float(module_dropout)
 
+    use_dora = is_true(kwargs.get("use_dora", False))
+    if use_dora and str(kwargs.get("dora_axis", "input")).strip().strip("'\"").casefold() not in ("", "input", "in"):
+        raise ValueError("sd-scripts trains DoRA on the input axis only (dora_scale, the ComfyUI layout)")
+    if use_dora:
+        logger.info("DoRA: magnitude on the input axis (dora_scale)")
+
     # すごく引数が多いな ( ^ω^)･･･
     network = LoRANetwork(
         text_encoder,
         unet,
+        module_class=dora_class(LoRAModule) if use_dora else LoRAModule,
         multiplier=multiplier,
         lora_dim=network_dim,
         alpha=network_alpha,
@@ -839,6 +847,8 @@ def create_network_from_weights(multiplier, file, vae, text_encoder, unet, weigh
             modules_alpha[key] = modules_dim[key]
 
     module_class = LoRAInfModule if for_inference else LoRAModule
+    if has_dora_weights(weights_sd):  # DoRA runs through its forward (no weight merge)
+        module_class = dora_class(LoRAModule)
 
     network = LoRANetwork(
         text_encoder,
@@ -1261,7 +1271,7 @@ class LoRANetwork(torch.nn.Module):
         if dtype is not None:
             for key in list(state_dict.keys()):
                 v = state_dict[key]
-                v = v.detach().clone().to("cpu").to(dtype)
+                v = v.detach().clone().to("cpu").to(saved_dtype(key, v, dtype))
                 state_dict[key] = v
 
         if os.path.splitext(file)[1] == ".safetensors":

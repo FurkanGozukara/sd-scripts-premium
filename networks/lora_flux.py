@@ -18,6 +18,7 @@ import torch
 from torch import Tensor
 import re
 from library.utils import setup_logging
+from networks.dora import dora_class, has_dora_weights, is_true, saved_dtype
 from library.sdxl_original_unet import SdxlUNet2DConditionModel
 
 setup_logging()
@@ -617,10 +618,17 @@ def create_network(
     else:
         reg_dims = None
 
+    use_dora = is_true(kwargs.get("use_dora", False))
+    if use_dora and str(kwargs.get("dora_axis", "input")).strip().strip("'\"").casefold() not in ("", "input", "in"):
+        raise ValueError("sd-scripts trains DoRA on the input axis only (dora_scale, the ComfyUI layout)")
+    if use_dora:
+        logger.info("DoRA: magnitude on the input axis (dora_scale)")
+
     # すごく引数が多いな ( ^ω^)･･･
     network = LoRANetwork(
         text_encoders,
         flux,
+        module_class=dora_class(LoRAModule) if use_dora else LoRAModule,
         multiplier=multiplier,
         lora_dim=network_dim,
         alpha=network_alpha,
@@ -690,6 +698,8 @@ def create_network_from_weights(multiplier, file, ae, text_encoders, flux, weigh
     split_qkv = False  # split_qkv is not needed to care, because state_dict is qkv combined
 
     module_class = LoRAInfModule if for_inference else LoRAModule
+    if has_dora_weights(weights_sd):  # DoRA runs through its forward (no weight merge)
+        module_class = dora_class(LoRAModule)
 
     network = LoRANetwork(
         text_encoders,
@@ -905,7 +915,7 @@ class LoRANetwork(torch.nn.Module):
                             split_dims = None
                             if is_flux and split_qkv:
                                 if "double" in lora_name and "qkv" in lora_name:
-                                    (split_dims,) = self.get_qkv_mlp_split_dims()[:3]  # qkv only
+                                    split_dims = self.get_qkv_mlp_split_dims()[:3]  # qkv only
                                 elif "single" in lora_name and "linear1" in lora_name:
                                     split_dims = self.get_qkv_mlp_split_dims()  # qkv + mlp
 
@@ -1143,6 +1153,9 @@ class LoRANetwork(torch.nn.Module):
 
             if key not in state_dict:
                 continue  # already merged
+            if key.endswith(".dora_scale"):  # DoRA scale of the whole (fused) weight: unchanged
+                new_state_dict[key] = state_dict[key]
+                continue
 
             lora_name = key.split(".")[0]
 
@@ -1394,7 +1407,7 @@ class LoRANetwork(torch.nn.Module):
         if dtype is not None:
             for key in list(state_dict.keys()):
                 v = state_dict[key]
-                v = v.detach().clone().to("cpu").to(dtype)
+                v = v.detach().clone().to("cpu").to(saved_dtype(key, v, dtype))
                 state_dict[key] = v
 
         # Free up memory before hash calculation
