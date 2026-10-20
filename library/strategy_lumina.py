@@ -216,6 +216,7 @@ class LuminaTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy)
         models: List[Any],
         text_encoding_strategy: TextEncodingStrategy,
         batch: List[train_util.ImageInfo],
+        captions: Optional[List[str]] = None,
     ) -> None:
         """
         Args:
@@ -230,7 +231,7 @@ class LuminaTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy)
         assert isinstance(text_encoding_strategy, LuminaTextEncodingStrategy)
         assert isinstance(tokenize_strategy, LuminaTokenizeStrategy)
 
-        captions = [info.caption for info in batch]
+        captions = captions if captions is not None else [info.caption for info in batch]
 
         if self.is_weighted:
             tokens, attention_masks, weights_list = (

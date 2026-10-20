@@ -409,7 +409,8 @@ class TextEncoderOutputsCachingStrategy:
         raise NotImplementedError
 
     def cache_batch_outputs(
-        self, tokenize_strategy: TokenizeStrategy, models: List[Any], text_encoding_strategy: TextEncodingStrategy, batch: List
+        self, tokenize_strategy: TokenizeStrategy, models: List[Any], text_encoding_strategy: TextEncodingStrategy, batch: List,
+        captions: Optional[List[str]] = None,  # the processed captions (prefix / suffix etc.); None: info.caption
     ):
         raise NotImplementedError
 

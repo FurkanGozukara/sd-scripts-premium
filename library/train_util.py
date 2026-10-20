@@ -178,6 +178,32 @@ def split_train_val(
         return paths[split:], sizes[split:]
 
 
+def add_caption_prefix_suffix(subset: "BaseSubset", caption: str) -> str:
+    """Add ``caption_prefix`` / ``caption_suffix`` of the subset to the caption."""
+    if subset.caption_prefix:
+        caption = subset.caption_prefix + " " + caption
+    if subset.caption_suffix:
+        caption = caption + " " + subset.caption_suffix
+    return caption
+
+
+def apply_caption_replacements(subset: "BaseSubset", caption: str, replacements: Dict[str, Any]) -> str:
+    """Replace ``secondary_separator`` with ``caption_separator`` and apply the (Textual Inversion) replacements."""
+    if subset.secondary_separator:
+        caption = caption.replace(subset.secondary_separator, subset.caption_separator)
+
+    for str_from, str_to in replacements.items():
+        if str_from == "":
+            # replace all
+            if type(str_to) == list:
+                caption = random.choice(str_to)
+            else:
+                caption = str_to
+        else:
+            caption = caption.replace(str_from, str_to)
+    return caption
+
+
 class ImageInfo:
     def __init__(self, image_key: str, num_repeats: int, caption: str, is_reg: bool, absolute_path: str) -> None:
         self.image_key: str = image_key
@@ -816,11 +842,14 @@ class BaseDataset(torch.utils.data.Dataset):
         self.replacements[str_from] = str_to
 
     def process_caption(self, subset: BaseSubset, caption):
-        # caption に prefix/suffix を付ける
-        if subset.caption_prefix:
-            caption = subset.caption_prefix + " " + caption
-        if subset.caption_suffix:
-            caption = caption + " " + subset.caption_suffix
+        # pick the caption's line before adding prefix / suffix (kohya-ss/sd-scripts #2455): with wildcards a random line,
+        # otherwise the first line (a suffix was appended to the last line and then cut with it)
+        if subset.enable_wildcard:
+            if "\n" in caption:
+                caption = random.choice(caption.split("\n"))
+        else:
+            caption = caption.split("\n")[0]
+        caption = add_caption_prefix_suffix(subset, caption)
 
         # dropoutの決定：tag dropがこのメソッド内にあるのでここで行うのが良い
         is_drop_out = subset.caption_dropout_rate > 0 and random.random() < subset.caption_dropout_rate
@@ -833,12 +862,8 @@ class BaseDataset(torch.utils.data.Dataset):
         if is_drop_out:
             caption = ""
         else:
-            # process wildcards
+            # process wildcards (the line is already picked)
             if subset.enable_wildcard:
-                # if caption is multiline, random choice one line
-                if "\n" in caption:
-                    caption = random.choice(caption.split("\n"))
-
                 # wildcard is like '{aaa|bbb|ccc...}'
                 # escape the curly braces like {{ or }}
                 replacer1 = "⦅"
@@ -857,9 +882,6 @@ class BaseDataset(torch.utils.data.Dataset):
 
                 # unescape the curly braces
                 caption = caption.replace(replacer1, "{").replace(replacer2, "}")
-            else:
-                # if caption is multiline, use the first line
-                caption = caption.split("\n")[0]
 
             if subset.shuffle_caption or subset.token_warmup_step > 0 or subset.caption_tag_dropout_rate > 0:
                 fixed_tokens = []
@@ -911,22 +933,19 @@ class BaseDataset(torch.utils.data.Dataset):
 
                 caption = ", ".join(fixed_tokens + flex_tokens + fixed_suffix_tokens)
 
-            # process secondary separator
-            if subset.secondary_separator:
-                caption = caption.replace(subset.secondary_separator, subset.caption_separator)
-
-            # textual inversion対応
-            for str_from, str_to in self.replacements.items():
-                if str_from == "":
-                    # replace all
-                    if type(str_to) == list:
-                        caption = random.choice(str_to)
-                    else:
-                        caption = str_to
-                else:
-                    caption = caption.replace(str_from, str_to)
+            caption = apply_caption_replacements(subset, caption, self.replacements)
 
         return caption
+
+    def process_caption_for_cache(self, subset: BaseSubset, caption: str) -> str:
+        """Deterministic part of :meth:`process_caption`, used for cached Text Encoder outputs (shared by every step):
+        the first line of a multi-line caption, prefix / suffix, secondary separator and the textual inversion
+        replacements. Dropout, shuffling, tag dropout and token warmup make the outputs uncacheable
+        (is_text_encoder_output_cacheable); wildcard captions are encoded as they are (warned there)."""
+        if not subset.enable_wildcard:
+            caption = caption.split("\n")[0]
+        caption = add_caption_prefix_suffix(subset, caption)
+        return apply_caption_replacements(subset, caption, self.replacements)
 
     def get_input_ids(self, caption, tokenizer=None):
         if tokenizer is None:
@@ -1097,6 +1116,11 @@ class BaseDataset(torch.utils.data.Dataset):
         return all([not subset.color_aug and not subset.random_crop for subset in self.subsets])
 
     def is_text_encoder_output_cacheable(self):
+        if any(subset.enable_wildcard for subset in self.subsets):
+            logger.warning(
+                "enable_wildcard has no effect when caching Text Encoder outputs: the caption is encoded as is (all lines, "
+                "`{a|b}` not replaced)"
+            )
         return all(
             [
                 not (
@@ -1346,7 +1370,9 @@ class BaseDataset(torch.utils.data.Dataset):
             for info in batch:
                 tqdm.write(f"{os.path.basename(info.absolute_path)} > {info.caption}")
             # cache_batch_latents(vae, cache_to_disk, batch, subset.flip_aug, subset.alpha_mask, subset.random_crop)
-            caching_strategy.cache_batch_outputs(tokenize_strategy, models, text_encoding_strategy, batch)
+            # the deterministic caption processing (prefix / suffix etc.); the random processing is not applicable
+            captions = [self.process_caption_for_cache(self.image_to_subset[info.image_key], info.caption) for info in batch]
+            caching_strategy.cache_batch_outputs(tokenize_strategy, models, text_encoding_strategy, batch, captions)
 
     # if weight_dtype is specified, Text Encoder itself and output will be converted to the dtype
     # this method is only for SDXL, but it should be implemented here because it needs to be a method of dataset
@@ -1696,7 +1722,7 @@ class BaseDataset(torch.utils.data.Dataset):
             flippeds.append(flipped)
 
             # captionとtext encoder outputを処理する
-            caption = image_info.caption  # default
+            caption = None
 
             tokenization_required = (
                 self.text_encoder_output_caching_strategy is None or self.text_encoder_output_caching_strategy.is_partial
@@ -1719,6 +1745,8 @@ class BaseDataset(torch.utils.data.Dataset):
             if tokenization_required:
                 caption = self.process_caption(subset, image_info.caption)
                 input_ids = [ids[0] for ids in self.tokenize_strategy.tokenize(caption)]  # remove batch dimension
+            else:
+                caption = self.process_caption_for_cache(subset, image_info.caption)  # as the cached outputs
                 # if self.XTI_layers:
                 #     caption_layer = []
                 #     for layer in self.XTI_layers:
@@ -1859,7 +1887,7 @@ class BaseDataset(torch.utils.data.Dataset):
                 assert random_crop == subset.random_crop, "random_crop must be same in a batch"
                 assert bucket_reso == image_info.bucket_reso, "bucket_reso must be same in a batch"
 
-            caption = image_info.caption  # TODO cache some patterns of dropping, shuffling, etc.
+            caption = self.process_caption_for_cache(subset, image_info.caption)  # TODO cache some patterns of dropping, shuffling, etc.
 
             if self.caching_mode == "latents":
                 image = load_image(image_info.absolute_path)
