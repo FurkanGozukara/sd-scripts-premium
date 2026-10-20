@@ -121,8 +121,8 @@ def test_swap_weight_devices_no_cuda(mock_sync_device):
         with patch('torch.Tensor.copy_'):
             swap_weight_devices_no_cuda(device, layer_to_cpu, layer_to_cuda)
             
-            # Verify _synchronize_device was called twice
-            assert mock_sync_device.call_count == 2
+            # after the swap and after moving the modules without a match (blocks of different structures)
+            assert mock_sync_device.call_count == 3
 
 
 # Offloader Tests
@@ -376,12 +376,15 @@ def test_offloading_integration():
 
 
 # Error handling tests
-def test_offloader_assertion_error():
-    with pytest.raises(AssertionError):
-        device = torch.device('cpu')
-        layer_to_cpu = SimpleModel()
-        layer_to_cuda = nn.Linear(10, 5)  # Different class
-        swap_weight_devices_cuda(device, layer_to_cpu, layer_to_cuda)
+def test_swap_matches_modules_of_different_container_types():
+    """sd-scripts-premium matches modules by name and shape (e.g. Sequential vs ModuleList blocks) instead of asserting
+    the same class."""
+    device = torch.device('cpu')
+    layer_to_cpu = nn.Sequential(nn.Linear(10, 5))
+    layer_to_cuda = nn.ModuleList([nn.Linear(10, 5)])
+    before = layer_to_cuda[0].weight.detach().clone()
+    swap_weight_devices_no_cuda(device, layer_to_cpu, layer_to_cuda)
+    assert torch.equal(layer_to_cuda[0].weight.detach(), before)
 
 if __name__ == "__main__":
     # Run all tests when file is executed directly
