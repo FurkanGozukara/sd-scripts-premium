@@ -4395,6 +4395,27 @@ def add_dit_training_arguments(parser: argparse.ArgumentParser):
         " / 順伝播および逆伝播中にスワップするブロックの数を設定します。"
         "この数を増やすと、トレーニング中のVRAM使用量が減りますが、トレーニング速度（s/it）も低下します。",
     )
+    # H2D-only block swap (kohya-ss/sd-scripts #2467, ported from Musubi Tuner): FLUX.1 LoRA training
+    parser.add_argument(
+        "--block_swap_h2d_only",
+        action="store_true",
+        help="(frozen-base / LoRA training only) H2D-only block swap: keep a CPU master copy of the streamed weights and"
+        " only copy Host->Device, never back, removing the D2H transfer. Requires --gradient_checkpointing.",
+    )
+    parser.add_argument(
+        "--block_swap_ring_size",
+        type=int,
+        default=2,
+        help="(with --block_swap_h2d_only) number of GPU ring buffers for streamed blocks: 2 = double buffering (one computed"
+        " on, one prefetched); 1 = least memory, no transfer / compute overlap.",
+    )
+    parser.add_argument(
+        "--use_pinned_memory_for_block_swap",
+        action="store_true",
+        help="(with --block_swap_h2d_only) keep the CPU master copies of the streamed weights in pinned memory for faster"
+        " Host->Device copies (more shared GPU memory on Windows); without it the transfers are staged through a small"
+        " pinned buffer pool on a worker thread.",
+    )
 
 
 def get_sanitized_config_or_none(args: argparse.Namespace):
