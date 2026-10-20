@@ -74,6 +74,7 @@ import library.model_util as model_util
 import library.huggingface_util as huggingface_util
 import library.sai_model_spec as sai_model_spec
 import library.deepspeed_utils as deepspeed_utils
+from library.color_profile import to_srgb
 from library.utils import setup_logging, resize_image, validate_interpolation_fn
 
 setup_logging()
@@ -3024,6 +3025,7 @@ def load_arbitrary_dataset(args, tokenizer=None) -> MinimalDataset:
 def load_image(image_path, alpha=False):
     try:
         with Image.open(image_path) as image:
+            image = to_srgb(image, image_path)  # an embedded colour profile (Display P3 phone photos, CMYK) -> sRGB
             if alpha:
                 if not image.mode == "RGBA":
                     image = image.convert("RGBA")
