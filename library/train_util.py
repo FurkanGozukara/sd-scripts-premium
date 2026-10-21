@@ -205,6 +205,59 @@ def apply_caption_replacements(subset: "BaseSubset", caption: str, replacements:
     return caption
 
 
+# enable_multiline_caption (kohya-ss/sd-scripts 31236c8, ported): the whole caption file is used with its line breaks,
+# and lines starting with this separator split it into caption candidates (one is chosen randomly at each step)
+DEFAULT_MULTILINE_CAPTION_SEPARATOR = "---===---"
+
+
+def normalize_multiline_caption(caption: str) -> str:
+    """Normalize a multi-line caption: strip trailing whitespace of each line and remove leading/trailing blank lines.
+
+    Leading whitespace of each line and blank lines in the middle are kept, because they may be intentional
+    (indentation, paragraph breaks).
+    """
+    lines = [line.rstrip() for line in caption.split("\n")]
+    while lines and lines[0] == "":
+        lines.pop(0)
+    while lines and lines[-1] == "":
+        lines.pop()
+    return "\n".join(lines)
+
+
+def split_caption_candidates(caption: str, separator: str) -> List[str]:
+    """Split a multi-line caption into candidates by separator lines.
+
+    A line whose stripped content starts with ``separator`` is a separator line. Text after ``#`` on a separator line
+    is a comment. Any other non-blank text between the separator and the comment is reserved for future extensions
+    (e.g. sampling weights) and raises ``ValueError``.
+
+    Each candidate is normalized with :func:`normalize_multiline_caption`; empty candidates are dropped.
+    Returns ``[""]`` if no candidate remains.
+    """
+    assert separator, "separator must not be empty"
+
+    candidates: List[str] = []
+    current: List[str] = []
+    for line in caption.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith(separator):
+            reserved = stripped[len(separator) :].split("#", 1)[0].strip()
+            if reserved:
+                raise ValueError(
+                    f"unsupported text after caption candidate separator (only `#` comments are allowed)"
+                    + f" / キャプション候補の区切り行の後ろに未対応の文字列があります（`#` によるコメントのみ指定可能です）: {line!r}"
+                )
+            candidates.append("\n".join(current))
+            current = []
+        else:
+            current.append(line)
+    candidates.append("\n".join(current))
+
+    candidates = [normalize_multiline_caption(c) for c in candidates]
+    candidates = [c for c in candidates if c != ""]
+    return candidates if candidates else [""]
+
+
 class ImageInfo:
     def __init__(self, image_key: str, num_repeats: int, caption: str, is_reg: bool, absolute_path: str) -> None:
         self.image_key: str = image_key
@@ -460,6 +513,8 @@ class BaseSubset:
         validation_seed: Optional[int] = None,
         validation_split: Optional[float] = 0.0,
         resize_interpolation: Optional[str] = None,
+        enable_multiline_caption: bool = False,
+        multiline_caption_separator: str = DEFAULT_MULTILINE_CAPTION_SEPARATOR,
     ) -> None:
         self.image_dir = image_dir
         self.alpha_mask = alpha_mask if alpha_mask is not None else False
@@ -470,6 +525,12 @@ class BaseSubset:
         self.keep_tokens_separator = keep_tokens_separator
         self.secondary_separator = secondary_separator
         self.enable_wildcard = enable_wildcard
+        self.enable_multiline_caption = enable_multiline_caption
+        if enable_multiline_caption:
+            assert (
+                multiline_caption_separator
+            ), "multiline_caption_separator must not be empty / multiline_caption_separatorは空にできません"
+        self.multiline_caption_separator = multiline_caption_separator
         self.color_aug = color_aug
         self.flip_aug = flip_aug
         self.face_crop_aug_range = face_crop_aug_range
@@ -524,6 +585,8 @@ class DreamBoothSubset(BaseSubset):
         validation_seed: Optional[int] = None,
         validation_split: Optional[float] = 0.0,
         resize_interpolation: Optional[str] = None,
+        enable_multiline_caption: bool = False,
+        multiline_caption_separator: str = DEFAULT_MULTILINE_CAPTION_SEPARATOR,
     ) -> None:
         assert image_dir is not None, "image_dir must be specified / image_dirは指定が必須です"
 
@@ -552,6 +615,8 @@ class DreamBoothSubset(BaseSubset):
             validation_seed=validation_seed,
             validation_split=validation_split,
             resize_interpolation=resize_interpolation,
+            enable_multiline_caption=enable_multiline_caption,
+            multiline_caption_separator=multiline_caption_separator,
         )
 
         self.is_reg = is_reg
@@ -595,6 +660,8 @@ class FineTuningSubset(BaseSubset):
         validation_seed: Optional[int] = None,
         validation_split: Optional[float] = 0.0,
         resize_interpolation: Optional[str] = None,
+        enable_multiline_caption: bool = False,
+        multiline_caption_separator: str = DEFAULT_MULTILINE_CAPTION_SEPARATOR,
     ) -> None:
         assert metadata_file is not None, "metadata_file must be specified / metadata_fileは指定が必須です"
 
@@ -623,6 +690,8 @@ class FineTuningSubset(BaseSubset):
             validation_seed=validation_seed,
             validation_split=validation_split,
             resize_interpolation=resize_interpolation,
+            enable_multiline_caption=enable_multiline_caption,
+            multiline_caption_separator=multiline_caption_separator,
         )
 
         self.metadata_file = metadata_file
@@ -662,6 +731,8 @@ class ControlNetSubset(BaseSubset):
         validation_seed: Optional[int] = None,
         validation_split: Optional[float] = 0.0,
         resize_interpolation: Optional[str] = None,
+        enable_multiline_caption: bool = False,
+        multiline_caption_separator: str = DEFAULT_MULTILINE_CAPTION_SEPARATOR,
     ) -> None:
         assert image_dir is not None, "image_dir must be specified / image_dirは指定が必須です"
 
@@ -690,6 +761,8 @@ class ControlNetSubset(BaseSubset):
             validation_seed=validation_seed,
             validation_split=validation_split,
             resize_interpolation=resize_interpolation,
+            enable_multiline_caption=enable_multiline_caption,
+            multiline_caption_separator=multiline_caption_separator,
         )
 
         self.conditioning_data_dir = conditioning_data_dir
@@ -753,6 +826,10 @@ class BaseDataset(torch.utils.data.Dataset):
 
         self.image_data: Dict[str, ImageInfo] = {}
         self.image_to_subset: Dict[str, Union[DreamBoothSubset, FineTuningSubset]] = {}
+
+        # True if any image has multiple caption candidates (enable_multiline_caption with separator lines).
+        # Text encoder outputs cannot be cached in that case because one candidate is chosen randomly at each step.
+        self.has_multiple_caption_candidates = False
 
         self.replacements = {}
 
@@ -842,10 +919,24 @@ class BaseDataset(torch.utils.data.Dataset):
     def add_replacement(self, str_from, str_to):
         self.replacements[str_from] = str_to
 
+    def validate_caption_candidates(self, subset: BaseSubset, captions: Sequence[str]):
+        """Validate separator lines of multi-line captions at loading time and record whether any image has
+        multiple candidates. Does nothing if ``enable_multiline_caption`` is disabled."""
+        if not subset.enable_multiline_caption:
+            return
+        for caption in captions:
+            candidates = split_caption_candidates(caption, subset.multiline_caption_separator)  # raises ValueError if invalid
+            if len(candidates) > 1:
+                self.has_multiple_caption_candidates = True
+
     def process_caption(self, subset: BaseSubset, caption):
-        # pick the caption's line before adding prefix / suffix (kohya-ss/sd-scripts #2455): with wildcards a random line,
-        # otherwise the first line (a suffix was appended to the last line and then cut with it)
-        if subset.enable_wildcard:
+        # pick the caption's candidate / line before adding prefix / suffix (kohya-ss/sd-scripts #2455): with
+        # enable_multiline_caption one of the candidates split by separator lines (line breaks kept), with wildcards a
+        # random line, otherwise the first line (a suffix was appended to the last line and then cut with it)
+        if subset.enable_multiline_caption:
+            candidates = split_caption_candidates(caption, subset.multiline_caption_separator)
+            caption = random.choice(candidates) if len(candidates) > 1 else candidates[0]
+        elif subset.enable_wildcard:
             if "\n" in caption:
                 caption = random.choice(caption.split("\n"))
         else:
@@ -884,7 +975,12 @@ class BaseDataset(torch.utils.data.Dataset):
                 # unescape the curly braces
                 caption = caption.replace(replacer1, "{").replace(replacer2, "}")
 
-            if subset.shuffle_caption or subset.token_warmup_step > 0 or subset.caption_tag_dropout_rate > 0:
+            # shuffle / tag dropout / token warmup are applied only to single-line captions:
+            # with enable_multiline_caption, a caption containing line breaks is used as is
+            is_single_line = not subset.enable_multiline_caption or "\n" not in caption
+            if is_single_line and (
+                subset.shuffle_caption or subset.token_warmup_step > 0 or subset.caption_tag_dropout_rate > 0
+            ):
                 fixed_tokens = []
                 flex_tokens = []
                 fixed_suffix_tokens = []
@@ -940,10 +1036,13 @@ class BaseDataset(torch.utils.data.Dataset):
 
     def process_caption_for_cache(self, subset: BaseSubset, caption: str) -> str:
         """Deterministic part of :meth:`process_caption`, used for cached Text Encoder outputs (shared by every step):
-        the first line of a multi-line caption, prefix / suffix, secondary separator and the textual inversion
-        replacements. Dropout, shuffling, tag dropout and token warmup make the outputs uncacheable
-        (is_text_encoder_output_cacheable); wildcard captions are encoded as they are (warned there)."""
-        if not subset.enable_wildcard:
+        the first line of a multi-line caption (with enable_multiline_caption the whole caption, normalized, which is
+        the only candidate: several candidates make the outputs uncacheable), prefix / suffix, secondary separator and
+        the textual inversion replacements. Dropout, shuffling, tag dropout and token warmup make the outputs
+        uncacheable (is_text_encoder_output_cacheable); wildcard captions are encoded as they are (warned there)."""
+        if subset.enable_multiline_caption:
+            caption = split_caption_candidates(caption, subset.multiline_caption_separator)[0]
+        elif not subset.enable_wildcard:
             caption = caption.split("\n")[0]
         caption = add_caption_prefix_suffix(subset, caption)
         return apply_caption_replacements(subset, caption, self.replacements)
@@ -1117,6 +1216,12 @@ class BaseDataset(torch.utils.data.Dataset):
         return all([not subset.color_aug and not subset.random_crop for subset in self.subsets])
 
     def is_text_encoder_output_cacheable(self):
+        if self.has_multiple_caption_candidates:
+            logger.error(
+                "Text Encoder outputs cannot be cached because some captions have multiple candidates (enable_multiline_caption with separator lines): one candidate is chosen randomly at each step"
+                + " / 複数のキャプション候補を持つ画像があるため（enable_multiline_caption と区切り行）、Text Encoder の出力をキャッシュできません。候補はステップごとにランダムに選ばれます"
+            )
+            return False
         if any(subset.enable_wildcard for subset in self.subsets):
             logger.warning(
                 "enable_wildcard has no effect when caching Text Encoder outputs: the caption is encoded as is (all lines, "
@@ -1927,6 +2032,44 @@ class BaseDataset(torch.utils.data.Dataset):
         return example
 
 
+def read_caption(
+    img_path: str, caption_extension: str, enable_wildcard: bool, enable_multiline_caption: bool = False
+) -> Optional[str]:
+    """Read the caption file for an image. Returns None if no caption file is found.
+
+    - enable_multiline_caption: the whole file is returned as is (line breaks are kept, separator lines are not
+      processed here; see ``split_caption_candidates``).
+    - enable_wildcard: non-empty lines are stripped and joined with ``\\n`` (one line is chosen randomly later).
+    - otherwise: only the first line is used.
+    """
+    # captionの候補ファイル名を作る
+    base_name = os.path.splitext(img_path)[0]
+    base_name_face_det = base_name
+    tokens = base_name.split("_")
+    if len(tokens) >= 5:
+        base_name_face_det = "_".join(tokens[:-4])
+    cap_paths = [base_name + caption_extension, base_name_face_det + caption_extension]
+
+    caption = None
+    for cap_path in cap_paths:
+        if os.path.isfile(cap_path):
+            with open(cap_path, "rt", encoding="utf-8") as f:
+                try:
+                    lines = f.readlines()
+                except UnicodeDecodeError as e:
+                    logger.error(f"illegal char in file (not UTF-8) / ファイルにUTF-8以外の文字があります: {cap_path}")
+                    raise e
+                assert len(lines) > 0, f"caption file is empty / キャプションファイルが空です: {cap_path}"
+                if enable_multiline_caption:
+                    caption = "".join(lines)  # 改行を含めてそのまま（正規化は候補分割時に行う）
+                elif enable_wildcard:
+                    caption = "\n".join([line.strip() for line in lines if line.strip() != ""])  # 空行を除く、改行で連結
+                else:
+                    caption = lines[0].strip()
+            break
+    return caption
+
+
 class DreamBoothDataset(BaseDataset):
     IMAGE_INFO_CACHE_FILE = "metadata_cache.json"
 
@@ -1977,32 +2120,6 @@ class DreamBoothDataset(BaseDataset):
             self.max_bucket_reso = None
             self.bucket_reso_steps = None  # この情報は使われない
             self.bucket_no_upscale = False
-
-        def read_caption(img_path, caption_extension, enable_wildcard):
-            # captionの候補ファイル名を作る
-            base_name = os.path.splitext(img_path)[0]
-            base_name_face_det = base_name
-            tokens = base_name.split("_")
-            if len(tokens) >= 5:
-                base_name_face_det = "_".join(tokens[:-4])
-            cap_paths = [base_name + caption_extension, base_name_face_det + caption_extension]
-
-            caption = None
-            for cap_path in cap_paths:
-                if os.path.isfile(cap_path):
-                    with open(cap_path, "rt", encoding="utf-8") as f:
-                        try:
-                            lines = f.readlines()
-                        except UnicodeDecodeError as e:
-                            logger.error(f"illegal char in file (not UTF-8) / ファイルにUTF-8以外の文字があります: {cap_path}")
-                            raise e
-                        assert len(lines) > 0, f"caption file is empty / キャプションファイルが空です: {cap_path}"
-                        if enable_wildcard:
-                            caption = "\n".join([line.strip() for line in lines if line.strip() != ""])  # 空行を除く、改行で連結
-                        else:
-                            caption = lines[0].strip()
-                    break
-            return caption
 
         def load_dreambooth_dir(subset: DreamBoothSubset):
             if not os.path.isdir(subset.image_dir):
@@ -2101,7 +2218,9 @@ class DreamBoothDataset(BaseDataset):
                 captions = []
                 missing_captions = []
                 for img_path in tqdm(img_paths, desc="read caption"):
-                    cap_for_img = read_caption(img_path, subset.caption_extension, subset.enable_wildcard)
+                    cap_for_img = read_caption(
+                        img_path, subset.caption_extension, subset.enable_wildcard, subset.enable_multiline_caption
+                    )
                     if cap_for_img is None and subset.class_tokens is None:
                         logger.warning(
                             f"neither caption file nor class tokens are found. use empty caption for {img_path} / キャプションファイルもclass tokenも見つかりませんでした。空のキャプションを使用します: {img_path}"
@@ -2114,6 +2233,9 @@ class DreamBoothDataset(BaseDataset):
                             missing_captions.append(img_path)
                         else:
                             captions.append(cap_for_img)
+
+            # validate separator lines of multi-line captions (raises ValueError if invalid)
+            self.validate_caption_candidates(subset, captions)
 
             self.set_tag_frequency(os.path.basename(subset.image_dir), captions)  # タグ頻度を記録
 
@@ -2219,6 +2341,54 @@ class DreamBoothDataset(BaseDataset):
         self.num_reg_images = num_reg_images
 
 
+def build_finetuning_caption(subset: FineTuningSubset, caption, tags: Optional[str]) -> str:
+    """Combine ``caption`` and ``tags`` of a metadata entry into the caption string stored in ``ImageInfo``.
+
+    - enable_multiline_caption: ``caption`` may be a string (which may contain separator lines) or a list of strings
+      (each element is a candidate). ``tags`` is appended to each candidate.
+    - enable_wildcard: ``tags`` is appended to each non-empty line of ``caption``.
+    - otherwise: ``tags`` is appended to ``caption``.
+    """
+    if isinstance(caption, list):
+        if not subset.enable_multiline_caption:
+            raise ValueError(
+                "caption must be a string unless enable_multiline_caption is enabled"
+                + " / enable_multiline_caption が無効の場合、caption は文字列でなければなりません"
+            )
+        if not all(isinstance(c, str) for c in caption):
+            raise ValueError("all elements of caption list must be strings / caption のリストの要素はすべて文字列でなければなりません")
+        caption = f"\n{subset.multiline_caption_separator}\n".join(caption)
+
+    if caption is None:
+        caption = ""
+
+    if tags is None or len(tags) == 0:
+        return caption
+
+    if subset.enable_multiline_caption:
+        # add tags to each candidate
+        candidates = split_caption_candidates(caption, subset.multiline_caption_separator)
+        if candidates == [""]:
+            return tags
+        candidates = [f"{c}{subset.caption_separator}{tags}" for c in candidates]
+        return f"\n{subset.multiline_caption_separator}\n".join(candidates)
+
+    if subset.enable_wildcard:
+        # tags must be single line (split by caption separator)
+        tags = tags.replace("\n", subset.caption_separator)
+
+        # add tags to each line of caption
+        caption_lines = [line for line in caption.split("\n") if line.strip() != ""]
+        if caption_lines:
+            return "\n".join([f"{line}{subset.caption_separator}{tags}" for line in caption_lines])
+        return tags  # no caption lines (e.g. tags-only metadata), use tags as is
+
+    # use as is
+    if len(caption) > 0:
+        caption = caption + subset.caption_separator
+    return caption + tags
+
+
 class FineTuningDataset(BaseDataset):
     def __init__(
         self,
@@ -2271,6 +2441,7 @@ class FineTuningDataset(BaseDataset):
                 continue
 
             tags_list = []
+            captions = []  # for validation of multi-line caption candidates
             for image_key, img_md in metadata.items():
                 # path情報を作る
                 abs_path = None
@@ -2301,24 +2472,12 @@ class FineTuningDataset(BaseDataset):
                     caption = tags  # could be multiline
                     tags = None
 
-                if subset.enable_wildcard:
-                    # tags must be single line
-                    if tags is not None:
-                        tags = tags.replace("\n", subset.caption_separator)
-
-                    # add tags to each line of caption
-                    if caption is not None and tags is not None:
-                        caption = "\n".join(
-                            [f"{line}{subset.caption_separator}{tags}" for line in caption.split("\n") if line.strip() != ""]
-                        )
-                else:
-                    # use as is
-                    if tags is not None and len(tags) > 0:
-                        caption = caption + subset.caption_separator + tags
-                        tags_list.append(tags)
-
-                if caption is None:
-                    caption = ""
+                caption = build_finetuning_caption(subset, caption, tags)
+                if tags is not None and len(tags) > 0:
+                    if subset.enable_wildcard and not subset.enable_multiline_caption:
+                        tags = tags.replace("\n", subset.caption_separator)  # same as build_finetuning_caption
+                    tags_list.append(tags)
+                captions.append(caption)
 
                 image_info = ImageInfo(image_key, subset.num_repeats, caption, False, abs_path)
                 image_info.image_size = img_md.get("train_resolution")
@@ -2330,6 +2489,9 @@ class FineTuningDataset(BaseDataset):
                 self.register_image(image_info, subset)
 
             self.num_train_images += len(metadata) * subset.num_repeats
+
+            # validate separator lines of multi-line captions (raises ValueError if invalid)
+            self.validate_caption_candidates(subset, captions)
 
             # TODO do not record tag freq when no tag
             self.set_tag_frequency(os.path.basename(subset.metadata_file), tags_list)
@@ -2498,6 +2660,8 @@ class ControlNetDataset(BaseDataset):
                 subset.token_warmup_min,
                 subset.token_warmup_step,
                 resize_interpolation=subset.resize_interpolation,
+                enable_multiline_caption=subset.enable_multiline_caption,
+                multiline_caption_separator=subset.multiline_caption_separator,
             )
             db_subsets.append(db_subset)
 
@@ -2521,6 +2685,7 @@ class ControlNetDataset(BaseDataset):
 
         # config_util等から参照される値をいれておく（若干微妙なのでなんとかしたい）
         self.image_data = self.dreambooth_dataset_delegate.image_data
+        self.has_multiple_caption_candidates = self.dreambooth_dataset_delegate.has_multiple_caption_candidates
         self.batch_size = batch_size
         self.num_train_images = self.dreambooth_dataset_delegate.num_train_images
         self.num_reg_images = self.dreambooth_dataset_delegate.num_reg_images
@@ -4626,6 +4791,19 @@ def add_dataset_arguments(
         "--enable_wildcard",
         action="store_true",
         help="enable wildcard for caption (e.g. '{image|picture|rendition}') / captionのワイルドカードを有効にする（例：'{image|picture|rendition}'）",
+    )
+    parser.add_argument(
+        "--enable_multiline_caption",
+        action="store_true",
+        help="use multi-line captions as they are (including line breaks). Multiple caption candidates can be separated by lines starting with `--multiline_caption_separator`, and one is chosen randomly at each step"
+        + " / 複数行のキャプションを改行を含めてそのまま使う。`--multiline_caption_separator` で始まる行で複数のキャプション候補を区切ると、ステップごとにランダムに1つが選ばれる",
+    )
+    parser.add_argument(
+        "--multiline_caption_separator",
+        type=str,
+        default=DEFAULT_MULTILINE_CAPTION_SEPARATOR,
+        help="prefix of the lines which separate caption candidates when `--enable_multiline_caption` is enabled. Text after `#` on the line is a comment"
+        + " / `--enable_multiline_caption` 有効時に、キャプション候補を区切る行の先頭文字列。行内の `#` 以降はコメント",
     )
     parser.add_argument(
         "--caption_prefix",

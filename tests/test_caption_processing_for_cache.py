@@ -14,6 +14,8 @@ from library.train_util import BaseDataset
 def make_subset(**overrides):
     params = dict(
         enable_wildcard=False,
+        enable_multiline_caption=False,
+        multiline_caption_separator="---===---",
         caption_prefix=None,
         caption_suffix=None,
         caption_dropout_rate=0.0,
@@ -32,7 +34,9 @@ def make_subset(**overrides):
 
 
 def make_dataset(replacements=None):
-    return SimpleNamespace(current_epoch=0, current_step=0, max_train_steps=100, replacements=replacements or {})
+    return SimpleNamespace(
+        current_epoch=0, current_step=0, max_train_steps=100, replacements=replacements or {}, has_multiple_caption_candidates=False
+    )
 
 
 def for_cache(subset, caption, replacements=None):
@@ -56,6 +60,13 @@ def test_for_cache_ignores_the_random_options():
 
 def test_for_cache_keeps_a_wildcard_caption_as_it_is():
     assert for_cache(make_subset(enable_wildcard=True, caption_prefix="pre"), "a {x|y}\nb") == "pre a {x|y}\nb"
+
+
+def test_for_cache_keeps_a_multiline_caption_whole():
+    # enable_multiline_caption: the whole caption (normalized), as process_caption trains on it
+    subset = make_subset(enable_multiline_caption=True, caption_prefix="pre", caption_suffix="suf")
+    assert for_cache(subset, "line1\nline2\n\n") == "pre line1\nline2 suf"
+    assert for_cache(subset, "line1\nline2\n\n") == BaseDataset.process_caption(make_dataset(), subset, "line1\nline2\n\n")
 
 
 def test_for_cache_matches_process_caption_for_plain_captions():
