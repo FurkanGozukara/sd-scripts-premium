@@ -31,6 +31,7 @@ init_ipex()
 
 from accelerate.utils import set_seed
 from library import deepspeed_utils, flux_train_utils, flux_utils, strategy_base, strategy_flux, sai_model_spec, compile_utils
+from library import partial_checkpointing
 from library.sd3_train_utils import FlowMatchEulerDiscreteScheduler
 
 import library.train_util as train_util
@@ -83,6 +84,8 @@ def train(args):
     ) or not args.cpu_offload_checkpointing, (
         "blocks_to_swap is not supported with cpu_offload_checkpointing / blocks_to_swapはcpu_offload_checkpointingと併用できません"
     )
+
+    partial_checkpointing.verify_gradient_checkpointing_skip_blocks(args)
 
     cache_latents = args.cache_latents
     use_dreambooth_method = args.in_json is None
@@ -282,7 +285,9 @@ def train(args):
     )
 
     if args.gradient_checkpointing:
-        flux.enable_gradient_checkpointing(cpu_offload=args.cpu_offload_checkpointing)
+        flux.enable_gradient_checkpointing(
+            cpu_offload=args.cpu_offload_checkpointing, skip_blocks=args.gradient_checkpointing_skip_blocks
+        )
 
     flux.requires_grad_(True)
 
@@ -849,6 +854,7 @@ def setup_parser() -> argparse.ArgumentParser:
     train_util.add_dit_training_arguments(parser)
     flux_train_utils.add_flux_train_arguments(parser)
     compile_utils.add_compile_arguments(parser)
+    partial_checkpointing.add_gradient_checkpointing_skip_blocks_argument(parser)
 
     parser.add_argument(
         "--mem_eff_save",

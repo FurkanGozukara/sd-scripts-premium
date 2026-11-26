@@ -22,6 +22,7 @@ from library import (
     strategy_flux,
     train_util,
     compile_utils,
+    partial_checkpointing,
 )
 from library.utils import setup_logging
 
@@ -103,6 +104,10 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
                 )
                 args.blocks_to_swap = 18  # 18 is safe for most cases
 
+        partial_checkpointing.verify_gradient_checkpointing_skip_blocks(args)
+        if args.gradient_checkpointing_skip_blocks > 0 and self.model_type == "chroma":
+            raise ValueError(f"{partial_checkpointing.OPTION} is not supported for Chroma, only for FLUX.1")
+
         train_dataset_group.verify_bucket_reso_steps(32)  # TODO check this
         if val_dataset_group is not None:
             val_dataset_group.verify_bucket_reso_steps(32)  # TODO check this
@@ -151,6 +156,9 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
 
         # if args.split_mode:
         #     model = self.prepare_split_model(model, weight_dtype, accelerator)
+
+        # partial gradient checkpointing: stored on the model, honoured when train_network enables checkpointing
+        partial_checkpointing.apply(model, args)
 
         self.is_swapping_blocks = args.blocks_to_swap is not None and args.blocks_to_swap > 0
         if self.is_swapping_blocks:
@@ -605,6 +613,7 @@ def setup_parser() -> argparse.ArgumentParser:
     train_util.add_dit_training_arguments(parser)
     flux_train_utils.add_flux_train_arguments(parser)
     compile_utils.add_compile_arguments(parser)
+    partial_checkpointing.add_gradient_checkpointing_skip_blocks_argument(parser)
 
     parser.add_argument(
         "--split_mode",

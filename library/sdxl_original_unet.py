@@ -30,6 +30,7 @@ import torch.utils.checkpoint
 from torch import nn
 from torch.nn import functional as F
 from einops import rearrange
+from library import partial_checkpointing
 from library.utils import setup_logging
 
 setup_logging()
@@ -834,6 +835,7 @@ class SdxlUNet2DConditionModel(nn.Module):
         self.adm_in_channels = ADM_IN_CHANNELS
 
         self.gradient_checkpointing = False
+        self.gradient_checkpointing_skip_blocks = 0
         self.blocks_to_swap = None
         # self.sample_size = sample_size
 
@@ -1039,9 +1041,33 @@ class SdxlUNet2DConditionModel(nn.Module):
     def is_gradient_checkpointing(self) -> bool:
         return any(hasattr(m, "gradient_checkpointing") and m.gradient_checkpointing for m in self.modules())
 
-    def enable_gradient_checkpointing(self):
+    def _gradient_checkpointing_blocks(self) -> list:
+        """The unit of --gradient_checkpointing_skip_blocks, in forward order: the UNet blocks that hold checkpointed layers
+        (ResNet, transformer, down / upsample): input blocks 1-8 (block 0 is conv_in), the middle block, output blocks 0-8."""
+        blocks = list(self.input_blocks) + [self.middle_block] + list(self.output_blocks)
+        return [block for block in blocks if any(hasattr(module, "gradient_checkpointing") for module in block.modules())]
+
+    @property
+    def checkpointed_block_count(self) -> int:
+        return len(self._gradient_checkpointing_blocks())  # SDXL: 18
+
+    def set_gradient_checkpointing_skip_blocks(self, skip_blocks: int):
+        """Partial gradient checkpointing: the last `skip_blocks` UNet blocks in forward order (output blocks first, from the
+        end) keep their activations instead of recomputing them in the backward pass. Applied now when checkpointing is on,
+        otherwise when it is enabled."""
+        self.gradient_checkpointing_skip_blocks = partial_checkpointing.validate_skip(skip_blocks, self.checkpointed_block_count, "SDXL")
+        if self.gradient_checkpointing:
+            self.set_gradient_checkpointing(value=True)
+
+    def enable_gradient_checkpointing(self, skip_blocks: Optional[int] = None):
+        """skip_blocks: see set_gradient_checkpointing_skip_blocks; None keeps the value set before, 0 checkpoints every block."""
+        if skip_blocks is not None:
+            self.gradient_checkpointing_skip_blocks = partial_checkpointing.validate_skip(skip_blocks, self.checkpointed_block_count, "SDXL")
         self.gradient_checkpointing = True
         self.set_gradient_checkpointing(value=True)
+        if self.gradient_checkpointing_skip_blocks:
+            total = self.checkpointed_block_count
+            logger.info(f"SDXL: gradient checkpointing enabled, checkpointed blocks: {total - self.gradient_checkpointing_skip_blocks}/{total}")
 
     def disable_gradient_checkpointing(self):
         self.gradient_checkpointing = False
@@ -1064,11 +1090,17 @@ class SdxlUNet2DConditionModel(nn.Module):
 
     def set_gradient_checkpointing(self, value=False):
         blocks = self.input_blocks + [self.middle_block] + self.output_blocks
+        kept = set()  # partial checkpointing: the last N checkpointed blocks keep their activations
+        if value and self.gradient_checkpointing_skip_blocks:
+            checkpointed = self._gradient_checkpointing_blocks()
+            total, skip = len(checkpointed), self.gradient_checkpointing_skip_blocks
+            kept = {id(block) for index, block in enumerate(checkpointed) if not partial_checkpointing.block_is_checkpointed(index, total, skip)}
         for block in blocks:
+            block_value = value and id(block) not in kept
             for module in block.modules():
                 if hasattr(module, "gradient_checkpointing"):
                     # logger.info(f{module.__class__.__name__} {module.gradient_checkpointing} -> {value}")
-                    module.gradient_checkpointing = value
+                    module.gradient_checkpointing = block_value
     
     def enable_block_swap(self, num_blocks: int, device: torch.device):
         """

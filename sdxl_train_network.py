@@ -8,6 +8,7 @@ from library.device_utils import init_ipex, clean_memory_on_device
 init_ipex()
 
 from library import sdxl_model_util, sdxl_train_util, strategy_base, strategy_sd, strategy_sdxl, train_util, compile_utils
+from library import partial_checkpointing
 import train_network
 from library.utils import setup_logging
 
@@ -49,6 +50,8 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
                     "Block swap works best with fused_backward_pass. Proceeding anyway, but you may want to enable it."
                 )
 
+        partial_checkpointing.verify_gradient_checkpointing_skip_blocks(args)
+
         train_dataset_group.verify_bucket_reso_steps(32)
         if val_dataset_group is not None:
             val_dataset_group.verify_bucket_reso_steps(32)
@@ -72,6 +75,9 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
         train_util.replace_unet_modules(unet, args.mem_eff_attn, args.xformers, args.sdpa)
         if torch.__version__ >= "2.0.0":  # PyTorch 2.0.0 以上対応のxformersなら以下が使える
             vae.set_use_memory_efficient_attention_xformers(args.xformers)
+
+        # partial gradient checkpointing: stored on the UNet, honoured when train_network enables checkpointing
+        partial_checkpointing.apply(unet, args)
 
         return sdxl_model_util.MODEL_VERSION_SDXL_BASE_V1_0, [text_encoder1, text_encoder2], vae, unet
 
@@ -344,6 +350,7 @@ def setup_parser() -> argparse.ArgumentParser:
     parser = train_network.setup_parser()
     sdxl_train_util.add_sdxl_training_arguments(parser)
     compile_utils.add_compile_arguments(parser)
+    partial_checkpointing.add_gradient_checkpointing_skip_blocks_argument(parser)
     
     parser.add_argument(
         "--fp8_scaled",

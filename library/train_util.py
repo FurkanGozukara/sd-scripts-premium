@@ -1709,10 +1709,14 @@ class BaseDataset(torch.utils.data.Dataset):
         flippeds = []  # 変数名が微妙
         text_encoder_outputs_list = []
         custom_attributes = []
+        subset_indices = []  # (dataset, subset) of each image for run control's loss.jsonl (kohya f40aa1d)
 
         for image_key in bucket[image_index : image_index + bucket_batch_size]:
             image_info = self.image_data[image_key]
             subset = self.image_to_subset[image_key]
+            subset_indices.append(
+                (getattr(self, "dataset_index", None), next((j for j, s in enumerate(getattr(self, "subsets", [])) if s is subset), None))
+            )
 
             custom_attributes.append(subset.custom_attributes)
 
@@ -1961,8 +1965,9 @@ class BaseDataset(torch.utils.data.Dataset):
 
         example["network_multipliers"] = torch.FloatTensor([self.network_multiplier] * len(captions))
 
-        if self.debug_dataset:
-            example["image_keys"] = bucket[image_index : image_index + self.batch_size]
+        # for debug_dataset and the per-sample loss log of run control (kohya 1f4e8b3 / f40aa1d)
+        example["image_keys"] = bucket[image_index : image_index + bucket_batch_size]
+        example["subset_indices"] = subset_indices
         return example
 
     def get_item_for_caching(self, bucket, bucket_batch_size, image_index):
@@ -2835,7 +2840,8 @@ class DatasetGroup(torch.utils.data.ConcatDataset):
         # simply concat together
         # TODO: handling image_data key duplication among dataset
         #   In practical, this is not the big issue because image_data is accessed from outside of dataset only for debug_dataset.
-        for dataset in datasets:
+        for dataset_index, dataset in enumerate(datasets):
+            dataset.dataset_index = dataset_index  # the position in ss_datasets, for run control's loss.jsonl
             self.image_data.update(dataset.image_data)
             self.num_train_images += dataset.num_train_images
             self.num_reg_images += dataset.num_reg_images
@@ -6558,8 +6564,8 @@ def line_to_prompt_dict(line: str) -> dict:
                 continue
 
             m = re.match(r"s (\d+)", parg, re.IGNORECASE)
-            if m:  # steps
-                prompt_dict["sample_steps"] = max(1, min(1000, int(m.group(1))))
+            if m:  # steps. 0 makes the prompt a reserved one (run control, kohya 0936383)
+                prompt_dict["sample_steps"] = max(0, min(1000, int(m.group(1))))
                 continue
 
             m = re.match(r"l ([\d\.]+)", parg, re.IGNORECASE)
@@ -6658,24 +6664,14 @@ def sample_images_common(
     StableDiffusionLongPromptWeightingPipelineの改造版を使うようにしたので、clip skipおよびプロンプトの重みづけに対応した
     TODO Use strategies here
     """
+    from library import run_control_sampling  # the schedule, and the prompts of a run control `sample` command
 
-    if steps == 0:
-        if not args.sample_at_first:
-            return
-    else:
-        if args.sample_every_n_steps is None and args.sample_every_n_epochs is None:
-            return
-        if args.sample_every_n_epochs is not None:
-            # sample_every_n_steps は無視する
-            if epoch is None or epoch % args.sample_every_n_epochs != 0:
-                return
-        else:
-            if steps % args.sample_every_n_steps != 0 or epoch is not None:  # steps is not divisible or end of epoch
-                return
+    if not run_control_sampling.should_sample_images(args, epoch, steps):
+        return
 
     logger.info("")
     logger.info(f"generating sample images at step / サンプル画像生成 ステップ: {steps}")
-    if not os.path.isfile(args.sample_prompts):
+    if not run_control_sampling.has_sample_prompts(args):
         logger.error(f"No prompt file / プロンプトファイルがありません: {args.sample_prompts}")
         return
 
@@ -6691,18 +6687,9 @@ def sample_images_common(
     else:
         text_encoder = accelerator.unwrap_model(text_encoder)
 
-    # read prompts
-    if args.sample_prompts.endswith(".txt"):
-        with open(args.sample_prompts, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-        prompts = [line.strip() for line in lines if len(line.strip()) > 0 and line[0] != "#"]
-    elif args.sample_prompts.endswith(".toml"):
-        with open(args.sample_prompts, "r", encoding="utf-8") as f:
-            data = toml.load(f)
-        prompts = [dict(**data["prompt"], **subset) for subset in data["prompt"]["subset"]]
-    elif args.sample_prompts.endswith(".json"):
-        with open(args.sample_prompts, "r", encoding="utf-8") as f:
-            prompts = json.load(f)
+    # read prompts: the prompt file without its reserved prompts (--s 0), or the prompts of a run control command, as
+    # parsed and numbered (`enum`) prompt dicts
+    prompts = run_control_sampling.get_sample_prompts(args)
 
     default_scheduler = get_my_scheduler(sample_sampler=args.sample_sampler, v_parameterization=args.v_parameterization)
 
@@ -6720,18 +6707,6 @@ def sample_images_common(
     pipeline.to(distributed_state.device)
     save_dir = args.output_dir + "/sample"
     os.makedirs(save_dir, exist_ok=True)
-
-    # preprocess prompts
-    for i in range(len(prompts)):
-        prompt_dict = prompts[i]
-        if isinstance(prompt_dict, str):
-            prompt_dict = line_to_prompt_dict(prompt_dict)
-            prompts[i] = prompt_dict
-        assert isinstance(prompt_dict, dict)
-
-        # Adds an enumerator to the dict based on prompt position. Used later to name image files. Also cleanup of extra data in original prompt dict.
-        prompt_dict["enum"] = i
-        prompt_dict.pop("subset", None)
 
     # save random state to restore later
     rng_state = torch.get_rng_state()
@@ -6858,6 +6833,9 @@ def sample_image_inference(
     i: int = prompt_dict["enum"]
     img_filename = f"{'' if args.output_name is None else args.output_name + '_'}{num_suffix}_{i:02d}_{ts_str}{seed_suffix}.png"
     image.save(os.path.join(save_dir, img_filename))
+    from library import run_control_sampling
+
+    run_control_sampling.notify_sample_saved(os.path.join(save_dir, img_filename))
 
     # send images to wandb if enabled
     if "wandb" in [tracker.name for tracker in accelerator.trackers]:

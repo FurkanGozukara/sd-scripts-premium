@@ -18,6 +18,7 @@ init_ipex()
 from accelerate.utils import set_seed
 from diffusers import DDPMScheduler
 from library import deepspeed_utils, sdxl_model_util, strategy_base, strategy_sd, strategy_sdxl, sai_model_spec, compile_utils
+from library import partial_checkpointing
 
 import library.train_util as train_util
 
@@ -108,6 +109,7 @@ def train(args):
                 "blocks_to_swap is set but neither fused_backward_pass nor blockwise_fused_optimizers is enabled. "
                 "Block swap works best with fused_backward_pass. Proceeding anyway, but you may want to enable it."
             )
+    partial_checkpointing.verify_gradient_checkpointing_skip_blocks(args)
     deepspeed_utils.prepare_deepspeed_args(args)
     setup_logging(args, reset=True)
 
@@ -290,7 +292,7 @@ def train(args):
 
     # 学習を準備する：モデルを適切な状態にする
     if args.gradient_checkpointing:
-        unet.enable_gradient_checkpointing()
+        unet.enable_gradient_checkpointing(skip_blocks=args.gradient_checkpointing_skip_blocks)
     train_unet = args.learning_rate != 0
     train_text_encoder1 = False
     train_text_encoder2 = False
@@ -1024,6 +1026,7 @@ def setup_parser() -> argparse.ArgumentParser:
     custom_train_functions.add_custom_train_arguments(parser)
     sdxl_train_util.add_sdxl_training_arguments(parser)
     compile_utils.add_compile_arguments(parser)
+    partial_checkpointing.add_gradient_checkpointing_skip_blocks_argument(parser)
 
     parser.add_argument(
         "--learning_rate_te1",

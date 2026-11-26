@@ -20,6 +20,7 @@ from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
 from library import custom_offloading_utils
+from library import partial_checkpointing
 
 # USE_REENTRANT = True
 
@@ -923,6 +924,7 @@ class Flux(nn.Module):
 
         self.gradient_checkpointing = False
         self.cpu_offload_checkpointing = False
+        self.gradient_checkpointing_skip_blocks = 0
         self.blocks_to_swap = None
 
         self.offloader_double = None
@@ -941,7 +943,24 @@ class Flux(nn.Module):
     def dtype(self):
         return next(self.parameters()).dtype
 
-    def enable_gradient_checkpointing(self, cpu_offload: bool = False):
+    @property
+    def checkpointed_block_count(self) -> int:
+        """The unit of --gradient_checkpointing_skip_blocks: double then single stream blocks in forward order (FLUX.1: 19 + 38).
+        The small time / vector / guidance embedders are always checkpointed and not counted."""
+        return self.num_double_blocks + self.num_single_blocks
+
+    def set_gradient_checkpointing_skip_blocks(self, skip_blocks: int):
+        """Partial gradient checkpointing: the last `skip_blocks` blocks in forward order keep their activations instead of
+        recomputing them in the backward pass. Applied now when checkpointing is on, otherwise when it is enabled."""
+        self.gradient_checkpointing_skip_blocks = partial_checkpointing.validate_skip(skip_blocks, self.checkpointed_block_count, "FLUX")
+        if self.gradient_checkpointing:
+            self.enable_gradient_checkpointing(cpu_offload=self.cpu_offload_checkpointing)
+
+    def enable_gradient_checkpointing(self, cpu_offload: bool = False, skip_blocks: Optional[int] = None):
+        """skip_blocks: the last N blocks in forward order keep their activations (partial gradient checkpointing, kohya-ss
+        sd-scripts 7a4153d); None keeps the value set before (set_gradient_checkpointing_skip_blocks), 0 checkpoints them all."""
+        if skip_blocks is not None:
+            self.gradient_checkpointing_skip_blocks = partial_checkpointing.validate_skip(skip_blocks, self.checkpointed_block_count, "FLUX")
         self.gradient_checkpointing = True
         self.cpu_offload_checkpointing = cpu_offload
 
@@ -950,10 +969,14 @@ class Flux(nn.Module):
         if self.guidance_in.__class__ != nn.Identity:
             self.guidance_in.enable_gradient_checkpointing()
 
-        for block in self.double_blocks + self.single_blocks:
-            block.enable_gradient_checkpointing(cpu_offload=cpu_offload)
+        total, skip = self.checkpointed_block_count, self.gradient_checkpointing_skip_blocks
+        for index, block in enumerate(self.double_blocks + self.single_blocks):
+            if partial_checkpointing.block_is_checkpointed(index, total, skip):
+                block.enable_gradient_checkpointing(cpu_offload=cpu_offload)
+            else:
+                block.disable_gradient_checkpointing()
 
-        print(f"FLUX: Gradient checkpointing enabled. CPU offload: {cpu_offload}")
+        print(f"FLUX: Gradient checkpointing enabled. CPU offload: {cpu_offload}, checkpointed blocks: {total - skip}/{total}")
 
     def disable_gradient_checkpointing(self):
         self.gradient_checkpointing = False
@@ -1087,13 +1110,20 @@ class Flux(nn.Module):
             controlnet_single_depth = len(block_controlnet_single_hidden_states)
 
         if not self.blocks_to_swap:
+            # CPU-offloaded checkpoints hand the next block CPU tensors; a block that keeps its activations (partial
+            # checkpointing) runs without the offload wrapper, so it takes them back to the GPU itself
+            to_device = self.training and self.cpu_offload_checkpointing and self.gradient_checkpointing_skip_blocks > 0
             for block_idx, block in enumerate(self.double_blocks):
+                if to_device and not block.gradient_checkpointing:
+                    img, txt = img.to(vec.device), txt.to(vec.device)
                 img, txt = block(img, txt, vec=vec, pe=pe, txt_attention_mask=txt_attention_mask)
                 if block_controlnet_hidden_states is not None and controlnet_depth > 0:
                     img = img + block_controlnet_hidden_states[block_idx % controlnet_depth]
 
             img = torch.cat((txt, img), 1)
             for block_idx, block in enumerate(self.single_blocks):
+                if to_device and not block.gradient_checkpointing:
+                    img = img.to(vec.device)
                 img = block(img, vec=vec, pe=pe, txt_attention_mask=txt_attention_mask)
                 if block_controlnet_single_hidden_states is not None and controlnet_single_depth > 0:
                     img = img + block_controlnet_single_hidden_states[block_idx % controlnet_single_depth]
